@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""sparktop — a live, top-style GPU monitor for the NVIDIA DGX Spark.
+
+Pure stdlib. Reads telemetry from `nvidia-smi` (NVML), which is the only
+interface that exposes GPU utilization/power/clocks on the GB10 superchip.
+
+Usage:
+    sparktop                 # live view, refresh every 1s
+    sparktop -n 2            # refresh every 2 seconds
+    sparktop --once          # print one snapshot and exit (good for scripts)
+    sparktop --no-color      # disable ANSI color
+
+Override the nvidia-smi binary (handy for testing) with:
+    SPARKTOP_NVIDIA_SMI=/path/to/fake-nvidia-smi sparktop
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+NVIDIA_SMI = os.environ.get("SPARKTOP_NVIDIA_SMI", "nvidia-smi")
+
+# Per-GPU fields, in query order. Keep names valid for `--query-gpu`.
+GPU_FIELDS = [
+    "index",
+    "name",
+    "driver_version",
+    "temperature.gpu",
+    "utilization.gpu",
+    "utilization.memory",
+    "memory.total",
+    "memory.used",
+    "memory.free",
+    "power.draw",
+    "power.limit",
+    "clocks.sm",
+    "clocks.mem",
+    "fan.speed",
+    "pstate",
+]
+
+PROC_FIELDS = ["pid", "process_name", "used_memory"]
+
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    CYAN = "\033[36m"
+    GREY = "\033[90m"
+
+    enabled = True
+
+    @classmethod
+    def wrap(cls, text: str, *codes: str) -> str:
+        if not cls.enabled or not codes:
+            return text
+        return "".join(codes) + text + cls.RESET
+
+
+ALT_SCREEN_ON = "\033[?1049h\033[?25l"   # enter alt buffer, hide cursor
+ALT_SCREEN_OFF = "\033[?25h\033[?1049l"  # show cursor, leave alt buffer
+HOME = "\033[H"
+CLEAR = "\033[2J"
+CLEAR_LINE = "\033[K"
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+@dataclass
+class Gpu:
+    index: str
+    name: str
+    driver: str
+    temp: float | None
+    util_gpu: float | None
+    util_mem: float | None
+    mem_total: float | None  # MiB
+    mem_used: float | None
+    mem_free: float | None
+    power_draw: float | None  # W
+    power_limit: float | None
+    clock_sm: float | None    # MHz
+    clock_mem: float | None
+    fan: float | None         # %
+    pstate: str
+
+
+@dataclass
+class Proc:
+    pid: str
+    name: str
+    mem: float | None  # MiB
+
+
+class SmiError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# nvidia-smi access
+# ---------------------------------------------------------------------------
+def _num(token: str) -> float | None:
+    token = token.strip()
+    if not token or token in ("[N/A]", "N/A", "[Not Supported]", "Not Supported"):
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _run_query(query_flag: str, fields: list[str]) -> list[list[str]]:
+    cmd = [
+        NVIDIA_SMI,
+        f"--{query_flag}={','.join(fields)}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10
+        )
+    except FileNotFoundError:
+        raise SmiError(
+            f"'{NVIDIA_SMI}' not found. Install the NVIDIA driver or set "
+            "SPARKTOP_NVIDIA_SMI to its path."
+        )
+    except subprocess.TimeoutExpired:
+        raise SmiError("nvidia-smi timed out.")
+    if out.returncode != 0:
+        msg = (out.stderr or out.stdout).strip()
+        hint = ""
+        if "version mismatch" in msg.lower():
+            hint = (
+                "\n\nThe NVIDIA kernel module and userspace library versions "
+                "don't match.\nThis usually happens after a driver update "
+                "before a reboot.\nFix it with:  sudo reboot"
+            )
+        raise SmiError(f"nvidia-smi failed:\n{msg}{hint}")
+    return [
+        [c.strip() for c in line.split(",")]
+        for line in out.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def read_gpus() -> list[Gpu]:
+    rows = _run_query("query-gpu", GPU_FIELDS)
+    gpus = []
+    for r in rows:
+        if len(r) < len(GPU_FIELDS):
+            continue
+        gpus.append(
+            Gpu(
+                index=r[0],
+                name=r[1],
+                driver=r[2],
+                temp=_num(r[3]),
+                util_gpu=_num(r[4]),
+                util_mem=_num(r[5]),
+                mem_total=_num(r[6]),
+                mem_used=_num(r[7]),
+                mem_free=_num(r[8]),
+                power_draw=_num(r[9]),
+                power_limit=_num(r[10]),
+                clock_sm=_num(r[11]),
+                clock_mem=_num(r[12]),
+                fan=_num(r[13]),
+                pstate=r[14],
+            )
+        )
+    return gpus
+
+
+def read_procs() -> list[Proc]:
+    try:
+        rows = _run_query("query-compute-apps", PROC_FIELDS)
+    except SmiError:
+        return []
+    procs = []
+    for r in rows:
+        if len(r) < 3:
+            continue
+        procs.append(Proc(pid=r[0], name=r[1], mem=_num(r[2])))
+    return procs
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def color_for_pct(pct: float) -> str:
+    if pct >= 90:
+        return C.RED
+    if pct >= 60:
+        return C.YELLOW
+    return C.GREEN
+
+
+def bar(pct: float | None, width: int, label_inside: str | None = None) -> str:
+    if pct is None:
+        body = "─" * width
+        return "[" + C.wrap(body, C.GREY) + "]"
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * width))
+    text = (label_inside or "")
+    if len(text) > width:  # don't let a long label spill past the bar
+        text = text[:width]
+    text = text.center(width)
+    out = []
+    col = color_for_pct(pct)
+    for i, ch in enumerate(text):
+        if i < filled:
+            out.append(C.wrap(ch if ch != " " else "█", col))
+        else:
+            out.append(C.wrap(ch if ch != " " else "·", C.GREY))
+    return "[" + "".join(out) + "]"
+
+
+def fmt(v: float | None, unit: str = "", nd: int = 0) -> str:
+    if v is None:
+        return "n/a"
+    if nd == 0:
+        return f"{int(round(v))}{unit}"
+    return f"{v:.{nd}f}{unit}"
+
+
+def gib(mib: float | None) -> str:
+    if mib is None:
+        return "n/a"
+    return f"{mib / 1024:.1f}GiB"
+
+
+def wrap_stats(stats: list[tuple[str, str]], width: int, indent: str = "  ") -> list[str]:
+    """Pack `(label, value)` stat segments into lines that fit `width`.
+
+    On a wide terminal everything lands on one line (identical to before);
+    on a skinny pane the segments flow onto as many lines as needed.
+    """
+    sep = "   "
+    avail = max(1, width - len(indent))
+    lines: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for k, v in stats:
+        plain_len = len(k) + 1 + len(v)  # "label value"
+        seg = f"{C.wrap(k, C.GREY)} {v}"
+        extra = plain_len + (len(sep) if cur else 0)
+        if cur and cur_len + extra > avail:
+            lines.append(indent + sep.join(cur))
+            cur, cur_len = [], 0
+            extra = plain_len
+        cur.append(seg)
+        cur_len += extra
+    if cur:
+        lines.append(indent + sep.join(cur))
+    return lines
+
+
+def render(
+    gpus: list[Gpu],
+    procs: list[Proc],
+    width: int,
+    interval: float,
+    clear_eol: bool = False,
+) -> str:
+    lines: list[str] = []
+    host = os.uname().nodename
+    now = time.strftime("%H:%M:%S")
+    driver = gpus[0].driver if gpus else "?"
+    narrow = width < 56
+    title = C.wrap(" sparktop ", C.BOLD, C.CYAN)
+    if narrow:
+        # Stack the metadata so nothing runs off a skinny pane.
+        lines.append(f"{title} {C.wrap(host, C.BOLD)}")
+        lines.append(C.wrap(f"driver {driver}  every {interval}s  {now}", C.GREY))
+    else:
+        head = (
+            f"{title} {C.wrap(host, C.BOLD)}  "
+            f"{C.wrap('driver ' + driver, C.GREY)}  "
+            f"{C.wrap('every ' + str(interval) + 's', C.GREY)}"
+        )
+        lines.append(head + "  " + C.wrap(now, C.GREY))
+    lines.append(C.wrap("─" * width, C.GREY))
+
+    # Wide: full bars with an external % readout. Narrow: drop the external %
+    # (it's already centered inside the bar) and give the bar the room instead.
+    if narrow:
+        bar_w = max(10, min(40, width - 12))  # "  Compute " (10) + "[]" (2)
+    else:
+        bar_w = max(20, min(40, width - 36))
+    for g in gpus:
+        lines.append(
+            C.wrap(f"GPU {g.index}", C.BOLD, C.BLUE)
+            + " "
+            + C.wrap(g.name, C.BOLD)
+            + "  "
+            + C.wrap(f"P-state {g.pstate}", C.GREY)
+        )
+        # Utilization
+        u = g.util_gpu
+        util_line = "  Compute " + bar(u, bar_w, f"{fmt(u, '%')}")
+        if not narrow:
+            util_line += "  " + C.wrap(
+                fmt(u, "%"), color_for_pct(u) if u is not None else C.GREY
+            )
+        lines.append(util_line)
+        # Memory
+        mem_pct = (
+            (g.mem_used / g.mem_total * 100)
+            if g.mem_used is not None and g.mem_total
+            else None
+        )
+        mem_inside = (
+            gib(g.mem_used) if narrow
+            else f"{gib(g.mem_used)}/{gib(g.mem_total)}"
+        )
+        mem_line = "  Memory  " + bar(mem_pct, bar_w, mem_inside)
+        if not narrow:
+            mem_line += "  " + C.wrap(
+                fmt(mem_pct, "%"), color_for_pct(mem_pct) if mem_pct is not None else C.GREY
+            )
+        lines.append(mem_line)
+        # Stats line
+        pwr = fmt(g.power_draw, "W", 1)
+        if g.power_limit:
+            pwr += "/" + fmt(g.power_limit, "W", 0)
+        stats = [
+            ("temp", fmt(g.temp, "°C")),
+            ("power", pwr),
+            ("SM clk", fmt(g.clock_sm, "MHz")),
+            ("mem clk", fmt(g.clock_mem, "MHz")),
+            ("fan", fmt(g.fan, "%")),
+        ]
+        lines.extend(wrap_stats(stats, width))
+        lines.append("")
+
+    # Processes
+    lines.append(C.wrap("GPU processes", C.BOLD))
+    if procs:
+        ordered = sorted(procs, key=lambda x: (x.mem or 0), reverse=True)
+        if narrow:
+            # Drop the fixed column padding; truncate names to what's left.
+            lines.append(C.wrap("  PID  MEM  PROCESS", C.GREY))
+            for p in ordered:
+                memstr = gib(p.mem)
+                used = 2 + len(str(p.pid)) + 1 + len(memstr) + 1
+                lines.append(
+                    f"  {p.pid} {memstr} {p.name[: max(0, width - used)]}"
+                )
+        else:
+            lines.append(C.wrap(f"  {'PID':>8}  {'MEM':>9}  PROCESS", C.GREY))
+            for p in ordered:
+                lines.append(
+                    f"  {p.pid:>8}  {gib(p.mem):>9}  {p.name[: max(0, width - 25)]}"
+                )
+    else:
+        lines.append(C.wrap("  (none)", C.GREY))
+
+    lines.append("")
+    lines.append(C.wrap("q / Ctrl-C to quit", C.GREY))
+    eol = CLEAR_LINE if clear_eol else ""
+    return "\n".join(line + eol for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def run_once(interval: float) -> int:
+    gpus = read_gpus()
+    procs = read_procs()
+    width = shutil.get_terminal_size((100, 24)).columns
+    print(render(gpus, procs, width, interval))
+    return 0
+
+
+def _wait_for_quit(timeout: float) -> bool:
+    """Sleep up to `timeout` seconds, returning True if the user pressed q.
+
+    Falls back to a plain sleep when stdin isn't an interactive terminal.
+    """
+    import select
+
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return False
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if r:
+        ch = sys.stdin.read(1)
+        return ch in ("q", "Q", "\x03")  # q or Ctrl-C
+    return False
+
+
+def run_live(interval: float) -> int:
+    import contextlib
+
+    termios = tty = old_term = None
+    if sys.stdin.isatty():
+        try:
+            import termios as _termios
+            import tty as _tty
+
+            termios, tty = _termios, _tty
+            old_term = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())  # read keys without Enter
+        except Exception:
+            termios = None
+
+    def restore(*_):
+        if termios and old_term is not None:
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+        sys.stdout.write(ALT_SCREEN_OFF)
+        sys.stdout.flush()
+
+    # Restore the terminal even if we're killed (e.g. SIGTERM from `timeout`).
+    prev_term = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit))
+
+    sys.stdout.write(ALT_SCREEN_ON)
+    sys.stdout.flush()
+    try:
+        while True:
+            try:
+                gpus = read_gpus()
+                procs = read_procs()
+                width = shutil.get_terminal_size((100, 24)).columns
+                frame = render(gpus, procs, width, interval, clear_eol=True)
+            except SmiError as e:
+                frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
+            sys.stdout.write(HOME + frame + "\n" + "\033[J")
+            sys.stdout.flush()
+            if _wait_for_quit(interval):
+                break
+    except (KeyboardInterrupt, BrokenPipeError, SystemExit):
+        pass
+    finally:
+        restore()
+        with contextlib.suppress(Exception):
+            signal.signal(signal.SIGTERM, prev_term)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="sparktop",
+        description="Live GPU monitor for the NVIDIA DGX Spark.",
+    )
+    p.add_argument(
+        "-n",
+        "--interval",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="refresh interval (default: 1.0)",
+    )
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="print a single snapshot and exit",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable ANSI color",
+    )
+    args = p.parse_args(argv)
+
+    if args.no_color or not sys.stdout.isatty():
+        C.enabled = False
+    if args.interval <= 0:
+        p.error("--interval must be positive")
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    if args.once:
+        try:
+            return run_once(args.interval)
+        except SmiError as e:
+            print(f"sparktop: {e}", file=sys.stderr)
+            return 1
+    return run_live(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
