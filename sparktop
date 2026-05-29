@@ -40,8 +40,6 @@ GPU_FIELDS = [
     "power.draw",
     "power.limit",
     "clocks.sm",
-    "clocks.mem",
-    "fan.speed",
     "pstate",
 ]
 
@@ -95,8 +93,6 @@ class Gpu:
     power_draw: float | None  # W
     power_limit: float | None
     clock_sm: float | None    # MHz
-    clock_mem: float | None
-    fan: float | None         # %
     pstate: str
     mem_unified: bool = False  # memory came from the shared system pool
 
@@ -179,9 +175,7 @@ def read_gpus() -> list[Gpu]:
                 power_draw=_num(r[9]),
                 power_limit=_num(r[10]),
                 clock_sm=_num(r[11]),
-                clock_mem=_num(r[12]),
-                fan=_num(r[13]),
-                pstate=r[14],
+                pstate=r[12],
             )
         )
     # Unified-memory fallback: when nvidia-smi exposes no VRAM (GB10/Grace
@@ -381,8 +375,6 @@ def render(
             ("temp", fmt(g.temp, "°C")),
             ("power", pwr),
             ("SM clk", fmt(g.clock_sm, "MHz")),
-            ("mem clk", fmt(g.clock_mem, "MHz")),
-            ("fan", fmt(g.fan, "%")),
         ]
         lines.extend(wrap_stats(stats, width))
         lines.append("")
