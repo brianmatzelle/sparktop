@@ -98,6 +98,7 @@ class Gpu:
     clock_mem: float | None
     fan: float | None         # %
     pstate: str
+    mem_unified: bool = False  # memory came from the shared system pool
 
 
 @dataclass
@@ -183,7 +184,43 @@ def read_gpus() -> list[Gpu]:
                 pstate=r[14],
             )
         )
+    # Unified-memory fallback: when nvidia-smi exposes no VRAM (GB10/Grace
+    # systems like the DGX Spark), fill memory from the shared system pool.
+    if any(g.mem_total is None for g in gpus):
+        sys_total, sys_used = read_meminfo()
+        if sys_total is not None:
+            for g in gpus:
+                if g.mem_total is None:
+                    g.mem_total = sys_total
+                    g.mem_used = sys_used
+                    g.mem_free = sys_total - (sys_used or 0)
+                    g.mem_unified = True
     return gpus
+
+
+def read_meminfo() -> tuple[float | None, float | None]:
+    """Return (total_mib, used_mib) from /proc/meminfo, or (None, None).
+
+    On unified-memory platforms like the DGX Spark, the GPU has no dedicated
+    VRAM, so nvidia-smi reports [N/A] for every memory field; the GPU instead
+    allocates from the shared system pool. We approximate "used" the same way
+    `free` does: MemTotal - MemAvailable.
+    """
+    vals: dict[str, float] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    vals[key] = float(rest.split()[0]) / 1024  # kB -> MiB
+                    if len(vals) == 2:
+                        break
+    except (OSError, ValueError, IndexError):
+        return None, None
+    total, avail = vals.get("MemTotal"), vals.get("MemAvailable")
+    if total is None or avail is None:
+        return None, None
+    return total, total - avail
 
 
 def read_procs() -> list[Proc]:
@@ -333,6 +370,8 @@ def render(
             mem_line += "  " + C.wrap(
                 fmt(mem_pct, "%"), color_for_pct(mem_pct) if mem_pct is not None else C.GREY
             )
+        if g.mem_unified:
+            mem_line += C.wrap(" unified", C.GREY)
         lines.append(mem_line)
         # Stats line
         pwr = fmt(g.power_draw, "W", 1)
