@@ -301,10 +301,34 @@ def wrap_stats(stats: list[tuple[str, str]], width: int, indent: str = "  ") -> 
     return lines
 
 
+def proc_section(procs: list[Proc], width: int, narrow: bool) -> list[str]:
+    """Render the 'GPU processes' table as a list of lines."""
+    lines = [C.wrap("GPU processes", C.BOLD)]
+    if not procs:
+        lines.append(C.wrap("  (none)", C.GREY))
+        return lines
+    ordered = sorted(procs, key=lambda x: (x.mem or 0), reverse=True)
+    if narrow:
+        # Drop the fixed column padding; truncate names to what's left.
+        lines.append(C.wrap("  PID  MEM  PROCESS", C.GREY))
+        for p in ordered:
+            memstr = gib(p.mem)
+            used = 2 + len(str(p.pid)) + 1 + len(memstr) + 1
+            lines.append(f"  {p.pid} {memstr} {p.name[: max(0, width - used)]}")
+    else:
+        lines.append(C.wrap(f"  {'PID':>8}  {'MEM':>9}  PROCESS", C.GREY))
+        for p in ordered:
+            lines.append(
+                f"  {p.pid:>8}  {gib(p.mem):>9}  {p.name[: max(0, width - 25)]}"
+            )
+    return lines
+
+
 def render(
     gpus: list[Gpu],
     procs: list[Proc],
     width: int,
+    height: int,
     interval: float,
     clear_eol: bool = False,
 ) -> str:
@@ -379,27 +403,16 @@ def render(
         lines.extend(wrap_stats(stats, width))
         lines.append("")
 
-    # Processes
-    lines.append(C.wrap("GPU processes", C.BOLD))
-    if procs:
-        ordered = sorted(procs, key=lambda x: (x.mem or 0), reverse=True)
-        if narrow:
-            # Drop the fixed column padding; truncate names to what's left.
-            lines.append(C.wrap("  PID  MEM  PROCESS", C.GREY))
-            for p in ordered:
-                memstr = gib(p.mem)
-                used = 2 + len(str(p.pid)) + 1 + len(memstr) + 1
-                lines.append(
-                    f"  {p.pid} {memstr} {p.name[: max(0, width - used)]}"
-                )
-        else:
-            lines.append(C.wrap(f"  {'PID':>8}  {'MEM':>9}  PROCESS", C.GREY))
-            for p in ordered:
-                lines.append(
-                    f"  {p.pid:>8}  {gib(p.mem):>9}  {p.name[: max(0, width - 25)]}"
-                )
-    else:
-        lines.append(C.wrap("  (none)", C.GREY))
+    # Processes are secondary. On a short pane — e.g. a wide strip pinned to
+    # the top of a tmux layout — hide the whole table so the GPU bars never
+    # scroll off the top. The +2 reserves the blank + footer below; the strict
+    # `<` leaves one row for the trailing newline in the live loop's write.
+    # `height <= 0` means unbounded (one-shot snapshots show everything).
+    procs_block = proc_section(procs, width, narrow)
+    if height <= 0 or len(lines) + len(procs_block) + 2 < height:
+        lines += procs_block
+    elif lines and lines[-1] == "":
+        lines.pop()  # avoid a double blank before the footer when procs hidden
 
     lines.append("")
     lines.append(C.wrap("q / Ctrl-C to quit", C.GREY))
@@ -414,7 +427,7 @@ def run_once(interval: float) -> int:
     gpus = read_gpus()
     procs = read_procs()
     width = shutil.get_terminal_size((100, 24)).columns
-    print(render(gpus, procs, width, interval))
+    print(render(gpus, procs, width, 0, interval))  # height 0 = show everything
     return 0
 
 
@@ -467,8 +480,10 @@ def run_live(interval: float) -> int:
             try:
                 gpus = read_gpus()
                 procs = read_procs()
-                width = shutil.get_terminal_size((100, 24)).columns
-                frame = render(gpus, procs, width, interval, clear_eol=True)
+                size = shutil.get_terminal_size((100, 24))
+                frame = render(
+                    gpus, procs, size.columns, size.lines, interval, clear_eol=True
+                )
             except SmiError as e:
                 frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
             sys.stdout.write(HOME + frame + "\n" + "\033[J")
