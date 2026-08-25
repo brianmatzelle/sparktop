@@ -63,7 +63,9 @@ class C:
     YELLOW = "\033[33m"
     BLUE = "\033[34m"
     CYAN = "\033[36m"
-    GREY = "\033[90m"
+    # 256-color mid-grey. Brighter than ANSI bright-black (90), which most
+    # dark terminal themes render too dim to read comfortably.
+    GREY = "\033[38;5;245m"
 
     enabled = True
 
