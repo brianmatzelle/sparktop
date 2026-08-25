@@ -6,6 +6,18 @@ Pure Python stdlib — no dependencies. It reads telemetry from `nvidia-smi`
 (NVML), which is the only interface that exposes GPU utilization, power, and
 clocks on the GB10 superchip (there are no Tegra-style sysfs load nodes).
 
+## Install
+
+```
+brew install brianmatzelle/tap/sparktop
+```
+
+Or run the script directly — it's pure stdlib, so any Python 3.11+ works:
+
+```
+git clone https://github.com/brianmatzelle/sparktop && ./sparktop/sparktop
+```
+
 ## Usage
 
 ```
@@ -19,12 +31,10 @@ sparktop --no-ports        # hide the ports pane
 sparktop --no-services     # hide the services pane
 ```
 
-It's installed at `~/.local/bin/sparktop` (a symlink to this script).
-
 ## What it shows
 
 - Per-GPU compute and memory utilization bars (color-coded by load)
-- Temperature, power draw/limit, SM and memory clocks, fan
+- Temperature, power draw/limit, SM clock, and P-state
 - **Services** — the systemd units you wrote, system and user, with state and PID
 - **Ports** — what's listening on the common dev ports, and who owns it
 - GPU compute processes, sorted by memory use
