@@ -9,6 +9,9 @@ Usage:
     sparktop -n 2            # refresh every 2 seconds
     sparktop --once          # print one snapshot and exit (good for scripts)
     sparktop --no-color      # disable ANSI color
+    sparktop --ports 3000-3009,8080   # which ports to watch
+    sparktop --no-services   # hide the systemd services pane
+    sparktop --no-ports      # hide the listening-ports pane
 
 Override the nvidia-smi binary (handy for testing) with:
     SPARKTOP_NVIDIA_SMI=/path/to/fake-nvidia-smi sparktop
@@ -17,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -102,6 +107,71 @@ class Proc:
     pid: str
     name: str
     mem: float | None  # MiB
+
+
+@dataclass
+class Service:
+    """A systemd unit we consider 'yours' (see read_services)."""
+    unit: str          # "garvis-bot.service"
+    scope: str         # "system" | "user"
+    state: str         # ActiveState, e.g. "active" / "failed"
+    sub: str           # SubState, e.g. "running" / "exited"
+    pid: str           # MainPID, "0" when there's no main process
+
+    @property
+    def short(self) -> str:
+        return self.unit[: -len(".service")] if self.unit.endswith(".service") else self.unit
+
+    @property
+    def status(self) -> str:
+        """The word we actually print: SubState is the informative half."""
+        return self.sub or self.state
+
+
+@dataclass
+class Listener:
+    """A socket bound to one of the watched dev ports."""
+    port: int
+    proto: str              # "tcp" | "udp"
+    binds: set[str]         # raw local addresses seen for this port
+    pid: str | None = None
+    proc: str | None = None  # process name from ss (truncated to 15 chars)
+    unit: str | None = None  # owning systemd unit, resolved via /proc/<pid>/cgroup
+    container: str | None = None  # owning docker container, via `docker ps`
+    uid: int | None = None  # socket owner, from /proc/net — set even when the
+    #                         process itself is unidentifiable
+
+    @property
+    def owner(self) -> str:
+        if self.unit:
+            return self.unit[: -len(".service")] if self.unit.endswith(".service") else self.unit
+        if self.container:
+            return self.container
+        return self.proc or "?"
+
+    @property
+    def owner_kind(self) -> str:
+        if self.unit:
+            return "unit"
+        if self.container:
+            return "docker"
+        return "proc" if self.proc else "unknown"
+
+    @property
+    def bind(self) -> str:
+        """One label for however many addresses this port is bound to.
+
+        A wildcard bind subsumes the rest; otherwise a routable address is the
+        interesting one, since that's what makes the port reachable off-box.
+        """
+        if any(b in ("0.0.0.0", "*", "::") for b in self.binds):
+            return "*"
+        routable = sorted(b for b in self.binds if not _loopback(b))
+        return routable[0] if routable else "local"
+
+    @property
+    def public(self) -> bool:
+        return self.bind != "local"
 
 
 class SmiError(Exception):
@@ -231,6 +301,295 @@ def read_procs() -> list[Proc]:
 
 
 # ---------------------------------------------------------------------------
+# systemd services
+# ---------------------------------------------------------------------------
+def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
+    """Run a command, returning stdout, or None if it isn't usable.
+
+    Unlike nvidia-smi, none of these sources are essential — a box without
+    systemd, ss or docker just shows fewer panes.
+    """
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
+
+
+# Unit files shipped by the distro live here; anything else is hand-written.
+VENDOR_UNIT_DIRS = ("/usr/lib/systemd/", "/lib/systemd/", "/run/systemd/", "/usr/local/lib/systemd/")
+
+SERVICE_PROPS = ["Id", "FragmentPath", "MainPID", "ActiveState", "SubState"]
+
+
+def _parse_show(text: str) -> list[dict[str, str]]:
+    """Split `systemctl show` output into one dict per blank-line-separated record."""
+    records, cur = [], {}
+    for line in text.splitlines():
+        if not line.strip():
+            if cur:
+                records.append(cur)
+                cur = {}
+            continue
+        key, _, val = line.partition("=")
+        cur[key] = val
+    if cur:
+        records.append(cur)
+    return records
+
+
+def _read_services_scope(scope: str) -> list[Service] | None:
+    cmd = ["systemctl"]
+    if scope == "user":
+        cmd.append("--user")
+    cmd += ["show", "*.service", f"--property={','.join(SERVICE_PROPS)}", "--no-pager"]
+    text = _run(cmd)
+    if text is None:
+        return None  # no systemd, or no user bus on this login
+    services = []
+    for rec in _parse_show(text):
+        unit, path = rec.get("Id", ""), rec.get("FragmentPath", "")
+        # "Yours" = a unit file you wrote. Vendor units live under /usr/lib or
+        # /lib; snap generates its own into /etc/systemd/system, so drop those
+        # by name. Units with no fragment at all are aliases/generated.
+        if not unit or not path or unit.startswith("snap."):
+            continue
+        if path.startswith(VENDOR_UNIT_DIRS):
+            continue
+        services.append(
+            Service(
+                unit=unit,
+                scope=scope,
+                state=rec.get("ActiveState", ""),
+                sub=rec.get("SubState", ""),
+                pid=rec.get("MainPID", "0"),
+            )
+        )
+    return services
+
+
+# Sort key: problems first, then things that are up, then the quiet ones.
+STATE_RANK = {"failed": 0, "activating": 1, "deactivating": 1, "active": 2}
+
+
+def read_services() -> list[Service] | None:
+    scopes = [_read_services_scope("system"), _read_services_scope("user")]
+    if all(s is None for s in scopes):
+        return None
+    services = [s for scope in scopes if scope for s in scope]
+    services.sort(
+        key=lambda s: (
+            STATE_RANK.get(s.state, 3),
+            s.sub != "running",
+            s.scope != "user",
+            s.short,
+        )
+    )
+    return services
+
+
+# ---------------------------------------------------------------------------
+# Listening ports
+# ---------------------------------------------------------------------------
+DEFAULT_PORT_SPEC = os.environ.get(
+    "SPARKTOP_PORTS",
+    "3000-3009,4000-4009,4321-4322,5000-5009,5173-5183,5432,6379,7860,"
+    "8000-8199,8888,9090,11434,19132,25565,25575,27017",
+)
+
+
+def parse_port_spec(spec: str) -> list[tuple[int, int]]:
+    """Turn "3000-3009,8080,25565" into [(3000, 3009), (8080, 8080), ...]."""
+    ranges: list[tuple[int, int]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        lo_s, _, hi_s = chunk.partition("-")
+        try:
+            lo = int(lo_s)
+            hi = int(hi_s) if hi_s else lo
+        except ValueError:
+            raise ValueError(f"bad port spec: {chunk!r}")
+        if not (0 < lo <= hi <= 65535):
+            raise ValueError(f"bad port range: {chunk!r}")
+        ranges.append((lo, hi))
+    return ranges
+
+
+def _in_ranges(port: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(lo <= port <= hi for lo, hi in ranges)
+
+
+def _loopback(host: str) -> bool:
+    return host.startswith("127.") or host in ("::1", "localhost")
+
+
+def _split_hostport(addr: str) -> tuple[str, int] | None:
+    """Split an ss local address ("127.0.0.1:8080", "[::]:22", "*:9090")."""
+    host, sep, port_s = addr.rpartition(":")
+    if not sep:
+        return None
+    try:
+        port = int(port_s)
+    except ValueError:
+        return None
+    host = host.partition("%")[0]  # drop the "%lo" scope suffix
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host, port
+
+
+def _pid_from_users(field: str) -> tuple[str, str] | None:
+    """Pull (pid, name) out of ss's `users:(("nginx",pid=42,fd=6))` column."""
+    m = re.search(r'\(\("([^"]*)",pid=(\d+)', field)
+    return (m.group(2), m.group(1)) if m else None
+
+
+# A container's processes live in /system.slice/docker-<full id>.scope.
+DOCKER_SCOPE = re.compile(r"docker-([0-9a-f]{12,64})\.scope")
+
+
+def cgroup_owner(pid: str) -> tuple[str | None, str | None]:
+    """Map a PID to its (systemd unit, docker container id) via its cgroup.
+
+    /proc/<pid>/cgroup is world-readable, so this works for other users'
+    processes too — unlike ss, which only names PIDs you own.
+    """
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            data = f.read()
+    except OSError:
+        return None, None
+    m = DOCKER_SCOPE.search(data)
+    if m:
+        return None, m.group(1)
+    for part in reversed(data.replace("\n", "/").split("/")):
+        if part.endswith(".service") and not part.startswith(("user@", "init")):
+            return part, None
+    return None, None
+
+
+# The listening state in /proc/net: TCP_LISTEN for tcp, TCP_CLOSE for udp.
+PROC_NET_LISTEN = {"tcp": "0A", "tcp6": "0A", "udp": "07", "udp6": "07"}
+
+
+def read_socket_uids() -> dict[tuple[str, int], int]:
+    """Map (proto, port) to the uid that owns the socket, from /proc/net.
+
+    ss only names PIDs you own, but /proc/net always exposes each socket's
+    uid. That's enough to say *whose* a port is even when the process behind
+    it can't be identified — a root-owned port says so instead of just "?".
+    """
+    uids: dict[tuple[str, int], int] = {}
+    for fname, listening in PROC_NET_LISTEN.items():
+        try:
+            with open(f"/proc/net/{fname}") as f:
+                next(f, None)  # column header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 8 or parts[3] != listening:
+                        continue
+                    try:
+                        port = int(parts[1].rpartition(":")[2], 16)
+                        uid = int(parts[7])
+                    except ValueError:
+                        continue
+                    # v4 and v6 share a port; either owner answers the question.
+                    uids.setdefault((fname.rstrip("6"), port), uid)
+        except OSError:
+            continue
+    return uids
+
+
+def username(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid{uid}"
+
+
+def read_docker() -> tuple[dict[int, str], dict[str, str]]:
+    """Ask docker for (published host port -> name, container id -> name).
+
+    Both are needed because containers reach the host's ports two ways:
+    a published port is proxied by a root-owned docker-proxy, so only the port
+    number identifies it; a `network_mode: host` container instead listens on
+    the host directly, so its own PID's cgroup names it — if ss can see it.
+    """
+    text = _run(
+        ["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Ports}}"],
+        timeout=3.0,
+    )
+    if not text:
+        return {}, {}
+    ports: dict[int, str] = {}
+    names: dict[str, str] = {}
+    for line in text.splitlines():
+        cid, _, rest = line.partition("\t")
+        name, _, portspec = rest.partition("\t")
+        if not name:
+            continue
+        names[cid] = name
+        # Published ports look like "0.0.0.0:25567->8080/tcp"; bare "5001/tcp"
+        # is merely exposed and isn't listening on the host.
+        for m in re.finditer(r"(?:\[[^\]]+\]|[\d.]+):(\d+)->", portspec):
+            ports.setdefault(int(m.group(1)), name)
+    return ports, names
+
+
+def read_listeners(
+    ranges: list[tuple[int, int]],
+    docker_ports: dict[int, str],
+    docker_names: dict[str, str],
+) -> list[Listener] | None:
+    # -tu gives a leading netid column, so the layout is the same either way.
+    text = _run(["ss", "-H", "-tulnp"], timeout=5.0)
+    if text is None:
+        return None  # no iproute2
+    found: dict[tuple[str, int], Listener] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, state, local = parts[0], parts[1], parts[4]
+        if state not in ("LISTEN", "UNCONN"):
+            continue
+        hp = _split_hostport(local)
+        if hp is None:
+            continue
+        host, port = hp
+        if not _in_ranges(port, ranges):
+            continue
+        key = (proto, port)
+        lis = found.get(key)
+        if lis is None:
+            lis = found[key] = Listener(port=port, proto=proto, binds=set())
+        lis.binds.add(host)
+        if lis.pid is None and len(parts) > 6:
+            got = _pid_from_users(parts[6])
+            if got:
+                lis.pid, lis.proc = got
+                lis.unit, cid = cgroup_owner(lis.pid)
+                if cid:
+                    lis.container = docker_names.get(cid) or docker_names.get(cid[:12])
+    uids = read_socket_uids()
+    for (proto, port), lis in found.items():
+        # Only fall back to the published-port map when we learned nothing
+        # useful: either ss named nobody (docker-proxy is root-owned, the usual
+        # case) or it named docker.service, which is true but says nothing.
+        if lis.container is None and port in docker_ports and (
+            lis.unit == "docker.service" or (lis.unit is None and lis.proc is None)
+        ):
+            lis.unit = None
+            lis.container = docker_ports[port]
+        lis.uid = uids.get((proto, port))
+    return sorted(found.values(), key=lambda l: (l.port, l.proto))
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 def color_for_pct(pct: float) -> str:
@@ -324,6 +683,119 @@ def proc_section(procs: list[Proc], width: int, narrow: bool) -> list[str]:
     return lines
 
 
+def _service_color(s: Service) -> str:
+    if s.state == "failed":
+        return C.RED
+    if s.state in ("activating", "deactivating"):
+        return C.YELLOW
+    if s.state == "active":
+        return C.GREEN if s.sub == "running" else C.GREY
+    return C.GREY
+
+
+def _service_glyph(s: Service) -> str:
+    if s.state in ("activating", "deactivating"):
+        return "◐"
+    return "●" if s.state in ("failed", "active") and s.sub != "exited" else "○"
+
+
+def service_section(services: list[Service], width: int, narrow: bool) -> list[str]:
+    """Render the 'Services' table (your own systemd units) as a list of lines."""
+    running = sum(1 for s in services if s.sub == "running")
+    failed = sum(1 for s in services if s.state == "failed")
+    tally = f"{running} up"
+    if failed:
+        tally += f", {failed} failed"
+    lines = [C.wrap("Services", C.BOLD) + "  " + C.wrap(f"({tally})", C.GREY)]
+    if not services:
+        lines.append(C.wrap("  (none)", C.GREY))
+        return lines
+    name_w = max(4, min(28, max(len(s.short) for s in services)))   # >= "UNIT"
+    stat_w = max(5, max(len(s.status) for s in services))           # >= "STATE"
+    if narrow:
+        lines.append(C.wrap("  UNIT  STATE", C.GREY))
+        for s in services:
+            col = _service_color(s)
+            used = 4 + 1 + len(s.status)
+            lines.append(
+                f"  {C.wrap(_service_glyph(s), col)} "
+                f"{s.short[: max(0, width - used)]} " + C.wrap(s.status, col)
+            )
+        return lines
+    lines.append(
+        C.wrap(f"    {'UNIT':<{name_w}}  {'SCOPE':<6}  {'STATE':<{stat_w}}  {'PID':>7}", C.GREY)
+    )
+    for s in services:
+        col = _service_color(s)
+        pid = s.pid if s.pid and s.pid != "0" else "-"
+        lines.append(
+            f"  {C.wrap(_service_glyph(s), col)} {s.short[:name_w]:<{name_w}}  "
+            + C.wrap(f"{s.scope:<6}", C.GREY)
+            + "  "
+            + C.wrap(f"{s.status:<{stat_w}}", col)
+            + "  "
+            + C.wrap(f"{pid:>7}", C.GREY)
+        )
+    return lines
+
+
+def port_section(listeners: list[Listener], width: int, narrow: bool) -> list[str]:
+    """Render the 'Ports' table (listeners in the watched ranges) as lines."""
+    public = sum(1 for l in listeners if l.public)
+    tally = f"{len(listeners)} listening"
+    if public:
+        tally += f", {public} public"
+    lines = [C.wrap("Ports", C.BOLD) + "  " + C.wrap(f"({tally})", C.GREY)]
+    if not listeners:
+        lines.append(C.wrap("  (nothing in the watched ranges)", C.GREY))
+        return lines
+
+    # tcp is the common case and goes unmarked; udp is called out.
+    labels = {id(l): f"{l.port}/udp" if l.proto == "udp" else str(l.port) for l in listeners}
+    port_w = max(4, max(len(v) for v in labels.values()))           # >= "PORT"
+    bind_w = max(4, min(15, max(len(l.bind) for l in listeners)))   # >= "BIND"
+    gap = " " if narrow else "  "
+    lines.append(
+        C.wrap(f"  {'PORT':>{port_w}}{gap}{'BIND':<{bind_w}}{gap}OWNER", C.GREY)
+    )
+    for l in listeners:
+        port = f"{labels[id(l)]:>{port_w}}"
+        bind = f"{l.bind[:bind_w]:<{bind_w}}"
+        if l.container:
+            tag = " ·docker"
+        elif l.owner_kind == "unknown" and l.uid is not None:
+            tag = " ·" + username(l.uid)  # at least say whose port it is
+        else:
+            tag = ""
+        used = 2 + port_w + len(gap) + bind_w + len(gap) + len(tag)
+        owner = (
+            l.owner[: max(0, width - used)]
+            if l.owner_kind != "unknown"
+            else C.wrap("?", C.GREY)
+        )
+        lines.append(
+            f"  {port}{gap}"
+            + C.wrap(bind, C.YELLOW if l.public else C.GREY)
+            + gap
+            + owner
+            + C.wrap(tag, C.GREY)
+        )
+    return lines
+
+
+# A pane is only worth showing if it can fit its heading, its column header,
+# one row of data, and the marker saying how much got cut.
+MIN_PANE_ROWS = 4
+
+
+def clip_pane(block: list[str], rows: int) -> list[str]:
+    """Trim a rendered table to `rows` lines, noting how many were dropped."""
+    if len(block) <= rows:
+        return block
+    keep = block[: max(1, rows - 1)]
+    return keep + [C.wrap(f"  … +{len(block) - len(keep)} more", C.GREY)]
+
+
 def render(
     gpus: list[Gpu],
     procs: list[Proc],
@@ -331,6 +803,8 @@ def render(
     height: int,
     interval: float,
     clear_eol: bool = False,
+    services: list[Service] | None = None,
+    listeners: list[Listener] | None = None,
 ) -> str:
     lines: list[str] = []
     host = os.uname().nodename
@@ -403,16 +877,43 @@ def render(
         lines.extend(wrap_stats(stats, width))
         lines.append("")
 
-    # Processes are secondary. On a short pane — e.g. a wide strip pinned to
-    # the top of a tmux layout — hide the whole table so the GPU bars never
-    # scroll off the top. The +2 reserves the blank + footer below; the strict
-    # `<` leaves one row for the trailing newline in the live loop's write.
-    # `height <= 0` means unbounded (one-shot snapshots show everything).
-    procs_block = proc_section(procs, width, narrow)
-    if height <= 0 or len(lines) + len(procs_block) + 2 < height:
-        lines += procs_block
+    # Everything below the GPU bars is secondary, in priority order. On a
+    # short pane — e.g. a wide strip pinned to the top of a tmux layout — drop
+    # whole tables from the bottom up so the GPU bars never scroll off the top.
+    # The +2 reserves the blank + footer below; the strict `<` leaves one row
+    # for the trailing newline in the live loop's write. `height <= 0` means
+    # unbounded (one-shot snapshots show everything).
+    blocks: list[list[str]] = []
+    if services is not None:
+        blocks.append(service_section(services, width, narrow))
+    if listeners is not None:
+        blocks.append(port_section(listeners, width, narrow))
+    blocks.append(proc_section(procs, width, narrow))
+
+    # Rows left for the panes. `lines` already ends in a blank row, which
+    # separates the first one; the 2 reserves the blank + footer below, and
+    # the extra 1 leaves a row for the live loop's trailing newline.
+    avail = max(0, height - len(lines) - 3) if height > 0 else -1  # -1 = unbounded
+    if avail >= 0:
+        # Drop whole panes from the bottom (lowest priority) until the rest
+        # can each show something, then share out what's left top-down.
+        n = len(blocks)
+        while n and n * MIN_PANE_ROWS + (n - 1) > avail:
+            n -= 1
+        blocks = blocks[:n]
+
+    body: list[str] = []
+    for i, block in enumerate(blocks):
+        if avail < 0:
+            body += ([""] if body else []) + block
+            continue
+        sep = 1 if body else 0
+        reserve = (len(blocks) - i - 1) * (MIN_PANE_ROWS + 1)
+        body += [""] * sep + clip_pane(block, avail - len(body) - sep - reserve)
+    if body:
+        lines += body
     elif lines and lines[-1] == "":
-        lines.pop()  # avoid a double blank before the footer when procs hidden
+        lines.pop()  # avoid a double blank before the footer when all hidden
 
     lines.append("")
     lines.append(C.wrap("q / Ctrl-C to quit", C.GREY))
@@ -423,11 +924,46 @@ def render(
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def run_once(interval: float) -> int:
+class Extras:
+    """Samples the service and port panes, throttling the slow sources.
+
+    `ss` is cheap enough to run every frame, but the unit list and the docker
+    container list barely move at 1 Hz, so they're re-read on a TTL instead.
+    """
+
+    TTL = 5.0
+
+    def __init__(self, want_services: bool, port_ranges: list[tuple[int, int]] | None):
+        self.want_services = want_services
+        self.port_ranges = port_ranges
+        self.services: list[Service] | None = None
+        self.docker_ports: dict[int, str] = {}
+        self.docker_names: dict[str, str] = {}
+        self._stamp = 0.0
+
+    def sample(self) -> tuple[list[Service] | None, list[Listener] | None]:
+        now = time.monotonic()
+        if not self._stamp or now - self._stamp >= self.TTL:
+            self._stamp = now
+            if self.want_services:
+                self.services = read_services()
+            if self.port_ranges is not None:
+                self.docker_ports, self.docker_names = read_docker()
+        listeners = (
+            read_listeners(self.port_ranges, self.docker_ports, self.docker_names)
+            if self.port_ranges is not None
+            else None
+        )
+        return self.services, listeners
+
+
+def run_once(interval: float, extras: Extras) -> int:
     gpus = read_gpus()
     procs = read_procs()
+    services, listeners = extras.sample()
     width = shutil.get_terminal_size((100, 24)).columns
-    print(render(gpus, procs, width, 0, interval))  # height 0 = show everything
+    # height 0 = show everything
+    print(render(gpus, procs, width, 0, interval, services=services, listeners=listeners))
     return 0
 
 
@@ -448,7 +984,7 @@ def _wait_for_quit(timeout: float) -> bool:
     return False
 
 
-def run_live(interval: float) -> int:
+def run_live(interval: float, extras: Extras) -> int:
     import contextlib
 
     termios = tty = old_term = None
@@ -480,9 +1016,17 @@ def run_live(interval: float) -> int:
             try:
                 gpus = read_gpus()
                 procs = read_procs()
+                services, listeners = extras.sample()
                 size = shutil.get_terminal_size((100, 24))
                 frame = render(
-                    gpus, procs, size.columns, size.lines, interval, clear_eol=True
+                    gpus,
+                    procs,
+                    size.columns,
+                    size.lines,
+                    interval,
+                    clear_eol=True,
+                    services=services,
+                    listeners=listeners,
                 )
             except SmiError as e:
                 frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
@@ -522,6 +1066,25 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="disable ANSI color",
     )
+    p.add_argument(
+        "--ports",
+        default=DEFAULT_PORT_SPEC,
+        metavar="SPEC",
+        help=(
+            "comma-separated ports/ranges to watch, e.g. '3000-3009,8080,25565' "
+            "(default: common dev ports; override with $SPARKTOP_PORTS)"
+        ),
+    )
+    p.add_argument(
+        "--no-ports",
+        action="store_true",
+        help="hide the listening-ports pane",
+    )
+    p.add_argument(
+        "--no-services",
+        action="store_true",
+        help="hide the systemd services pane",
+    )
     args = p.parse_args(argv)
 
     if args.no_color or not sys.stdout.isatty():
@@ -529,15 +1092,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.interval <= 0:
         p.error("--interval must be positive")
 
+    ranges = None
+    if not args.no_ports:
+        try:
+            ranges = parse_port_spec(args.ports)
+        except ValueError as e:
+            p.error(str(e))
+    extras = Extras(want_services=not args.no_services, port_ranges=ranges)
+
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     if args.once:
         try:
-            return run_once(args.interval)
+            return run_once(args.interval, extras)
         except SmiError as e:
             print(f"sparktop: {e}", file=sys.stderr)
             return 1
-    return run_live(args.interval)
+    return run_live(args.interval, extras)
 
 
 if __name__ == "__main__":
