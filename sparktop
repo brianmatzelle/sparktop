@@ -12,6 +12,11 @@ Usage:
     sparktop --ports 3000-3009,8080   # which ports to watch
     sparktop --no-services   # hide the systemd services pane
     sparktop --no-ports      # hide the listening-ports pane
+    sparktop --no-air        # hide the air-quality pane
+
+If an air-quality Feather is plugged into USB, its readings show up in an
+"Air" pane. The board is found automatically via /dev/serial/by-id; point
+sparktop at a specific port with --air-device or $SPARKTOP_AIR_DEVICE.
 
 Override the nvidia-smi binary (handy for testing) with:
     SPARKTOP_NVIDIA_SMI=/path/to/fake-nvidia-smi sparktop
@@ -19,6 +24,8 @@ Override the nvidia-smi binary (handy for testing) with:
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import os
 import pwd
 import re
@@ -174,6 +181,25 @@ class Listener:
     @property
     def public(self) -> bool:
         return self.bind != "local"
+
+
+@dataclass
+class Air:
+    """One reading from an air-quality Feather on the USB port."""
+    src: str | None          # which board sent it, e.g. "feather-1"
+    age: float               # seconds since the line arrived
+    co2: float | None        # ppm
+    temp: float | None       # °C
+    rh: float | None         # % relative humidity
+    pm2p5: float | None      # µg/m³
+    pm10: float | None       # µg/m³
+    voc: float | None        # Sensirion VOC index, 1-500 (100 = baseline)
+    nox: float | None        # Sensirion NOx index, 1-500 (1 = nothing there)
+    pending: bool = False    # board is there, but hasn't published yet
+
+    @property
+    def stale(self) -> bool:
+        return self.age > AIR_STALE_AFTER
 
 
 class SmiError(Exception):
@@ -592,6 +618,211 @@ def read_listeners(
 
 
 # ---------------------------------------------------------------------------
+# Air-quality sensor (USB serial)
+# ---------------------------------------------------------------------------
+# An Adafruit Feather ESP32-S3 running the room-monitor firmware prints one
+# line every 30 seconds:
+#
+#     [DATA] {"src":"feather-1","co2":1081,"temperature":24.99, ...}
+#
+# A field the sensor can't vouch for is omitted rather than sent as zero, so a
+# missing key means "warming up", not "measured zero" — hence `n/a` and not 0
+# wherever a key is absent below.
+AIR_BAUD = 115200  # sensor.serial_baud in the firmware's config.yaml
+
+# Auto-detection only ever opens a port whose by-id name says it is one of
+# these boards; a printer or a modem on some other /dev/ttyACM* is left alone.
+# Point --air-device at the port to override.
+AIR_ID_PATTERN = re.compile(r"feather|esp32|adafruit", re.I)
+
+# Keys we recognise. A line carrying none of them isn't a sensor reading.
+AIR_KEYS = frozenset(
+    {"co2", "temperature", "relative_humidity", "voc_index", "nox_index"}
+    | {f"mass_concentration_pm{n}" for n in ("1p0", "2p5", "4p0", "10p0")}
+)
+
+# Three missed publishes. Past this a reading is still shown, but marked.
+AIR_STALE_AFTER = 95.0
+
+
+def _air_cache_path() -> str:
+    """Where the last reading is parked between runs."""
+    import tempfile
+
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return os.path.join(base, f"sparktop-air-{os.getuid()}.json")
+
+
+def _air_cache_read() -> tuple[dict | None, float]:
+    try:
+        with open(_air_cache_path(), encoding="utf-8") as fh:
+            blob = json.load(fh)
+        reading = blob["reading"]
+        if isinstance(reading, dict):
+            return reading, float(blob["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None, 0.0
+
+
+def _air_cache_write(reading: dict, at: float) -> None:
+    path = _air_cache_path()
+    tmp = f"{path}.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": at, "reading": reading}, fh)
+        os.replace(tmp, path)  # atomic: a concurrent reader sees one or other
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _air_num(reading: dict, key: str) -> float | None:
+    v = reading.get(key)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+class AirReader:
+    """Non-blocking tail of the air sensor's USB serial line.
+
+    There is nothing to poll: the board talks once every 30 seconds, so a
+    frame just drains whatever the kernel has buffered for us and keeps the
+    newest complete line. Readings survive a restart through a small cache
+    file, which is what makes `--once` useful — a freshly opened port shows
+    nothing at all until the board's next publish, up to 30s later.
+
+    Read-only and hands-off: the port is opened O_RDONLY with CLOCAL set, so
+    running this alongside a serial monitor is fine and the board is never
+    reset or written to.
+    """
+
+    RETRY = 5.0  # how often to go looking for the port again once it's gone
+
+    def __init__(self, device: str | None = None):
+        self._device = device  # explicit path, or None to auto-detect
+        self._fd: int | None = None
+        self._buf = b""
+        self._probed = 0.0
+        self._reading, self._at = _air_cache_read()
+
+    # -- the port -----------------------------------------------------------
+    def _discover(self) -> str | None:
+        if self._device:
+            return self._device if os.path.exists(self._device) else None
+        for path in sorted(glob.glob("/dev/serial/by-id/*")):
+            if AIR_ID_PATTERN.search(os.path.basename(path)):
+                return path
+        return None
+
+    def _open(self) -> None:
+        path = self._discover()
+        if not path:
+            return
+        try:
+            import termios
+        except ImportError:
+            return
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError:
+            return  # unplugged mid-probe, or we're not in the dialout group
+        try:
+            # Raw, no flow control, and CLOCAL so a dropped carrier doesn't
+            # hang up on us. VMIN/VTIME 0 keeps every read non-blocking.
+            cc = list(termios.tcgetattr(fd)[6])
+            cc[termios.VMIN] = 0
+            cc[termios.VTIME] = 0
+            speed = getattr(termios, f"B{AIR_BAUD}")
+            termios.tcsetattr(
+                fd,
+                termios.TCSANOW,
+                [0, 0, termios.CS8 | termios.CREAD | termios.CLOCAL, 0,
+                 speed, speed, cc],
+            )
+        except Exception:
+            os.close(fd)
+            return
+        self._fd, self._buf = fd, b""
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self._fd, self._buf = None, b""
+
+    # -- the bytes ----------------------------------------------------------
+    def _drain(self) -> None:
+        while self._fd is not None:
+            try:
+                chunk = os.read(self._fd, 8192)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.close()  # unplugged
+                return
+            if not chunk:
+                break
+            self._buf += chunk
+        if b"\n" in self._buf:
+            *lines, self._buf = self._buf.split(b"\n")
+            for line in lines:
+                self._feed(line)
+        elif len(self._buf) > 8192:
+            self._buf = b""  # something is talking, but not in lines we know
+
+    def _feed(self, line: bytes) -> None:
+        start = line.find(b"{")
+        if start < 0:
+            return
+        try:
+            obj = json.loads(line[start:].decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(obj, dict) or not AIR_KEYS & obj.keys():
+            return
+        self._reading, self._at = obj, time.time()
+        _air_cache_write(obj, self._at)
+
+    # -- the reading --------------------------------------------------------
+    def sample(self) -> Air | None:
+        now = time.monotonic()
+        if self._fd is None and (not self._probed or now - self._probed >= self.RETRY):
+            self._probed = now
+            self._open()
+        if self._fd is not None:
+            self._drain()
+
+        if self._reading is None:
+            # Port open but the board hasn't spoken yet: say so, rather than
+            # leaving a gap where the pane is about to appear.
+            return (
+                Air(None, 0.0, None, None, None, None, None, None, None, pending=True)
+                if self._fd is not None
+                else None
+            )
+        age = max(0.0, time.time() - self._at)
+        if self._fd is None and age > AIR_STALE_AFTER:
+            return None  # board gone and the last reading has aged out
+        r = self._reading
+        src = r.get("src")
+        return Air(
+            src=src if isinstance(src, str) else None,
+            age=age,
+            co2=_air_num(r, "co2"),
+            temp=_air_num(r, "temperature"),
+            rh=_air_num(r, "relative_humidity"),
+            pm2p5=_air_num(r, "mass_concentration_pm2p5"),
+            pm10=_air_num(r, "mass_concentration_pm10p0"),
+            voc=_air_num(r, "voc_index"),
+            nox=_air_num(r, "nox_index"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 def color_for_pct(pct: float) -> str:
@@ -602,7 +833,14 @@ def color_for_pct(pct: float) -> str:
     return C.GREEN
 
 
-def bar(pct: float | None, width: int, label_inside: str | None = None) -> str:
+def bar(
+    pct: float | None,
+    width: int,
+    label_inside: str | None = None,
+    color: str | None = None,
+) -> str:
+    """A filled bar. `color` overrides the default load-style colouring —
+    CO2, say, is not "bad at 90%" but bad at its own thresholds."""
     if pct is None:
         body = "─" * width
         return "[" + C.wrap(body, C.GREY) + "]"
@@ -613,7 +851,7 @@ def bar(pct: float | None, width: int, label_inside: str | None = None) -> str:
         text = text[:width]
     text = text.center(width)
     out = []
-    col = color_for_pct(pct)
+    col = color or color_for_pct(pct)
     for i, ch in enumerate(text):
         if i < filled:
             out.append(C.wrap(ch if ch != " " else "█", col))
@@ -636,8 +874,11 @@ def gib(mib: float | None) -> str:
     return f"{mib / 1024:.1f}GiB"
 
 
-def wrap_stats(stats: list[tuple[str, str]], width: int, indent: str = "  ") -> list[str]:
+def wrap_stats(stats: list[tuple], width: int, indent: str = "  ") -> list[str]:
     """Pack `(label, value)` stat segments into lines that fit `width`.
+
+    A third element, if present, colours the value — measured against the
+    plain text, so the escape codes never count towards the width.
 
     On a wide terminal everything lands on one line (identical to before);
     on a skinny pane the segments flow onto as many lines as needed.
@@ -647,9 +888,9 @@ def wrap_stats(stats: list[tuple[str, str]], width: int, indent: str = "  ") -> 
     lines: list[str] = []
     cur: list[str] = []
     cur_len = 0
-    for k, v in stats:
+    for k, v, *rest in stats:
         plain_len = len(k) + 1 + len(v)  # "label value"
-        seg = f"{C.wrap(k, C.GREY)} {v}"
+        seg = f"{C.wrap(k, C.GREY)} {C.wrap(v, *rest) if rest else v}"
         extra = plain_len + (len(sep) if cur else 0)
         if cur and cur_len + extra > avail:
             lines.append(indent + sep.join(cur))
@@ -682,6 +923,74 @@ def proc_section(procs: list[Proc], width: int, narrow: bool) -> list[str]:
             lines.append(
                 f"  {p.pid:>8}  {gib(p.mem):>9}  {p.name[: max(0, width - 25)]}"
             )
+    return lines
+
+
+# Indoor CO2, in the usual rule-of-thumb bands: ~400 ppm is outdoor air,
+# 1000 is the common ventilation target, and past 1500 people report the
+# headaches and fog that ventilation guidance is written to avoid.
+def _co2_verdict(ppm: float | None) -> tuple[str, str]:
+    if ppm is None:
+        return "", C.GREY
+    if ppm < 1000:
+        return "fresh", C.GREEN
+    if ppm < 1500:
+        return "stuffy", C.YELLOW
+    return "poor", C.RED
+
+
+# PM2.5 against the EPA's AQI breakpoints for the good/moderate boundary
+# (12 µg/m³) and the start of "unhealthy for sensitive groups" (35.4).
+def _pm_color(ugm3: float | None) -> str:
+    if ugm3 is None:
+        return C.GREY
+    if ugm3 <= 12:
+        return C.GREEN
+    if ugm3 <= 35.4:
+        return C.YELLOW
+    return C.RED
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    return f"{seconds / 3600:.1f}h ago"
+
+
+def air_section(air: Air, width: int, narrow: bool) -> list[str]:
+    """Render the 'Air' pane — the USB air-quality sensor's latest reading."""
+    if air.pending:
+        return [
+            C.wrap("Air", C.BOLD) + "  " + C.wrap("(sensor found)", C.GREY),
+            C.wrap("  waiting for the first reading (up to 30s)", C.GREY),
+        ]
+    tag = ", ".join(x for x in (air.src, _ago(air.age)) if x)
+    head = C.wrap("Air", C.BOLD) + "  " + C.wrap(f"({tag})", C.GREY)
+    if air.stale:
+        head += "  " + C.wrap("stale", C.YELLOW)
+    lines = [head]
+
+    word, col = _co2_verdict(air.co2)
+    # 400 ppm is outdoor air and nothing indoors reads below it; 2000 is well
+    # past the point where the only useful message is "open a window".
+    pct = None if air.co2 is None else (air.co2 - 400) / 16.0
+    bar_w = max(10, min(40, width - (12 if narrow else 36)))
+    line = "  CO2     " + bar(pct, bar_w, fmt(air.co2, "ppm"), color=col)
+    if not narrow and word:
+        line += "  " + C.wrap(word, col)
+    lines.append(line)
+
+    stats = [
+        ("temp", fmt(air.temp, "°C", 1)),
+        ("RH", fmt(air.rh, "%", 0)),
+        ("PM2.5", fmt(air.pm2p5, "µg/m³", 1), _pm_color(air.pm2p5)),
+        ("PM10", fmt(air.pm10, "µg/m³", 1)),
+        ("VOC", fmt(air.voc, "", 0)),
+        ("NOx", fmt(air.nox, "", 0)),
+    ]
+    lines.extend(wrap_stats(stats, width))
     return lines
 
 
@@ -807,6 +1116,7 @@ def render(
     clear_eol: bool = False,
     services: list[Service] | None = None,
     listeners: list[Listener] | None = None,
+    air: Air | None = None,
 ) -> str:
     lines: list[str] = []
     host = os.uname().nodename
@@ -886,6 +1196,10 @@ def render(
     # for the trailing newline in the live loop's write. `height <= 0` means
     # unbounded (one-shot snapshots show everything).
     blocks: list[list[str]] = []
+    if air is not None:
+        # First of the secondary panes: it's the shortest of them, and a
+        # room you have to leave outranks a service you can restart.
+        blocks.append(air_section(air, width, narrow))
     if services is not None:
         blocks.append(service_section(services, width, narrow))
     if listeners is not None:
@@ -927,23 +1241,35 @@ def render(
 # Main loop
 # ---------------------------------------------------------------------------
 class Extras:
-    """Samples the service and port panes, throttling the slow sources.
+    """Samples the secondary panes, throttling the slow sources.
 
     `ss` is cheap enough to run every frame, but the unit list and the docker
     container list barely move at 1 Hz, so they're re-read on a TTL instead.
+    The air sensor needs no throttling of its own: draining a serial buffer
+    that is nearly always empty costs one non-blocking read.
     """
 
     TTL = 5.0
 
-    def __init__(self, want_services: bool, port_ranges: list[tuple[int, int]] | None):
+    def __init__(
+        self,
+        want_services: bool,
+        port_ranges: list[tuple[int, int]] | None,
+        air: AirReader | None = None,
+    ):
         self.want_services = want_services
         self.port_ranges = port_ranges
+        self.air = air
         self.services: list[Service] | None = None
         self.docker_ports: dict[int, str] = {}
         self.docker_names: dict[str, str] = {}
         self._stamp = 0.0
 
-    def sample(self) -> tuple[list[Service] | None, list[Listener] | None]:
+    def close(self) -> None:
+        if self.air is not None:
+            self.air.close()
+
+    def sample(self) -> tuple[list[Service] | None, list[Listener] | None, Air | None]:
         now = time.monotonic()
         if not self._stamp or now - self._stamp >= self.TTL:
             self._stamp = now
@@ -956,16 +1282,21 @@ class Extras:
             if self.port_ranges is not None
             else None
         )
-        return self.services, listeners
+        return self.services, listeners, (self.air.sample() if self.air else None)
 
 
 def run_once(interval: float, extras: Extras) -> int:
     gpus = read_gpus()
     procs = read_procs()
-    services, listeners = extras.sample()
+    services, listeners, air = extras.sample()
     width = shutil.get_terminal_size((100, 24)).columns
     # height 0 = show everything
-    print(render(gpus, procs, width, 0, interval, services=services, listeners=listeners))
+    print(
+        render(
+            gpus, procs, width, 0, interval,
+            services=services, listeners=listeners, air=air,
+        )
+    )
     return 0
 
 
@@ -1018,7 +1349,7 @@ def run_live(interval: float, extras: Extras) -> int:
             try:
                 gpus = read_gpus()
                 procs = read_procs()
-                services, listeners = extras.sample()
+                services, listeners, air = extras.sample()
                 size = shutil.get_terminal_size((100, 24))
                 frame = render(
                     gpus,
@@ -1029,6 +1360,7 @@ def run_live(interval: float, extras: Extras) -> int:
                     clear_eol=True,
                     services=services,
                     listeners=listeners,
+                    air=air,
                 )
             except SmiError as e:
                 frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
@@ -1040,6 +1372,7 @@ def run_live(interval: float, extras: Extras) -> int:
         pass
     finally:
         restore()
+        extras.close()
         with contextlib.suppress(Exception):
             signal.signal(signal.SIGTERM, prev_term)
     return 0
@@ -1087,6 +1420,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="hide the systemd services pane",
     )
+    p.add_argument(
+        "--air-device",
+        default=os.environ.get("SPARKTOP_AIR_DEVICE"),
+        metavar="PATH",
+        help=(
+            "serial port of the air-quality sensor (default: auto-detect a "
+            "Feather/ESP32 under /dev/serial/by-id; $SPARKTOP_AIR_DEVICE)"
+        ),
+    )
+    p.add_argument(
+        "--no-air",
+        action="store_true",
+        help="hide the air-quality pane",
+    )
     args = p.parse_args(argv)
 
     if args.no_color or not sys.stdout.isatty():
@@ -1100,7 +1447,11 @@ def main(argv: list[str] | None = None) -> int:
             ranges = parse_port_spec(args.ports)
         except ValueError as e:
             p.error(str(e))
-    extras = Extras(want_services=not args.no_services, port_ranges=ranges)
+    extras = Extras(
+        want_services=not args.no_services,
+        port_ranges=ranges,
+        air=None if args.no_air else AirReader(args.air_device),
+    )
 
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
@@ -1110,6 +1461,8 @@ def main(argv: list[str] | None = None) -> int:
         except SmiError as e:
             print(f"sparktop: {e}", file=sys.stderr)
             return 1
+        finally:
+            extras.close()
     return run_live(args.interval, extras)
 
 

@@ -29,12 +29,16 @@ sparktop --no-color # disable color
 sparktop --ports 3000-3009,8080,25565   # which ports to watch
 sparktop --no-ports        # hide the ports pane
 sparktop --no-services     # hide the services pane
+
+sparktop --air-device /dev/ttyACM0   # air sensor's serial port
+sparktop --no-air          # hide the air-quality pane
 ```
 
 ## What it shows
 
 - Per-GPU compute and memory utilization bars (color-coded by load)
 - Temperature, power draw/limit, SM clock, and P-state
+- **Air** — the room, if an air-quality sensor is plugged into USB
 - **Services** — the systemd units you wrote, system and user, with state and PID
 - **Ports** — what's listening on the common dev ports, and who owns it
 - GPU compute processes, sorted by memory use
@@ -42,6 +46,45 @@ sparktop --no-services     # hide the services pane
 Panes are listed in that order and shrink to fit: on a short pane each one is
 truncated with a `… +N more` marker, and the lowest-priority panes drop out
 entirely before the GPU bars ever scroll off the top.
+
+## Air
+
+If an [air-quality Feather](https://github.com/brianmatzelle/air-quality-sensor)
+is plugged into USB, sparktop tails its serial output and shows the latest
+reading: CO2 on a bar, then temperature, humidity, PM2.5, PM10, and the
+Sensirion VOC and NOx indices.
+
+```
+Air  (feather-1, 12s ago)
+  CO2     [████████████████1101ppm·················]  stuffy
+  temp 25.8°C   RH 43%   PM2.5 2.6µg/m³   PM10 2.6µg/m³   VOC 99   NOx 1
+```
+
+The CO2 bar spans 400 ppm (outdoor air) to 2000, and reads `fresh` below
+1000, `stuffy` below 1500, and `poor` above it. PM2.5 is colored on the EPA's
+AQI breakpoints — green to 12 µg/m³, yellow to 35.4, red past that. A field
+the sensor can't vouch for yet shows `n/a` rather than a fake zero.
+
+The board is found automatically: sparktop opens the first
+`/dev/serial/by-id/*` entry whose name mentions a Feather, ESP32, or Adafruit
+board, so an unrelated `/dev/ttyACM*` is never touched. Point `--air-device`
+or `$SPARKTOP_AIR_DEVICE` at a port to override that. The port is opened
+read-only with `CLOCAL` set and is never written to, so the board isn't reset
+and a serial monitor can stay open alongside.
+
+The pane only appears when a sensor is actually there, and it disappears
+again about 95 seconds after one is unplugged. Because the board publishes
+only every 30 seconds, the last reading is cached in `$XDG_RUNTIME_DIR` —
+that's what lets `--once` print a real value instead of waiting half a minute
+for the next one. A reading older than 95 seconds is marked `stale`.
+
+Reading the port needs membership in the `dialout` group:
+
+```
+sudo usermod -aG dialout $USER   # log out and back in
+```
+
+Without it the pane simply stays hidden.
 
 ## Services
 
