@@ -32,6 +32,9 @@ sparktop --no-services     # hide the services pane
 
 sparktop --air-device /dev/ttyACM0   # air sensor's serial port
 sparktop --no-air          # hide the air-quality pane
+
+sparktop --db ~/air.db     # where the sqlite database lives
+sparktop --no-db           # don't record anything
 ```
 
 ## What it shows
@@ -74,9 +77,10 @@ and a serial monitor can stay open alongside.
 
 The pane only appears when a sensor is actually there, and it disappears
 again about 95 seconds after one is unplugged. Because the board publishes
-only every 30 seconds, the last reading is cached in `$XDG_RUNTIME_DIR` —
-that's what lets `--once` print a real value instead of waiting half a minute
-for the next one. A reading older than 95 seconds is marked `stale`.
+only every 30 seconds, the newest row in the [database](#database) is shown
+until the next line arrives — that's what lets `--once` print a real value
+instead of waiting half a minute. A reading older than 95 seconds is marked
+`stale`.
 
 Reading the port needs membership in the `dialout` group:
 
@@ -85,6 +89,37 @@ sudo usermod -aG dialout $USER   # log out and back in
 ```
 
 Without it the pane simply stays hidden.
+
+## Database
+
+sparktop keeps a small sqlite database at
+`~/.local/share/sparktop/sparktop.db` (`$XDG_DATA_HOME` is honoured; point
+`--db` or `$SPARKTOP_DB` somewhere else, or pass `--no-db` to record nothing).
+Every line the air sensor sends is stored as one row in `air_readings`:
+
+| column | |
+|---|---|
+| `at` | unix time the line arrived |
+| `src`, `seq`, `uptime_s` | which board, its publish counter, seconds since it booted |
+| `co2` | ppm |
+| `temperature`, `relative_humidity` | °C, % |
+| `pm1p0`, `pm2p5`, `pm4p0`, `pm10p0` | µg/m³ |
+| `voc_index`, `nox_index` | Sensirion indices |
+| `raw` | the JSON object exactly as sent, so nothing the firmware adds later is lost |
+
+A field the board left out is `NULL`. It's a plain sqlite file, so history
+is a query away:
+
+```
+sqlite3 ~/.local/share/sparktop/sparktop.db \
+  "select datetime(at,'unixepoch','localtime'), co2, pm2p5 from air_readings
+   where at > unixepoch('now','-1 day') order by at"
+```
+
+One row every 30 seconds comes to roughly a megabyte a day; nothing is
+pruned. The database is opened in WAL mode, so a second sparktop or a
+`sqlite3` shell can read it while one is writing. If the file can't be
+opened, sparktop says so on stderr and runs without it.
 
 ## Services
 

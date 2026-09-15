@@ -13,10 +13,15 @@ Usage:
     sparktop --no-services   # hide the systemd services pane
     sparktop --no-ports      # hide the listening-ports pane
     sparktop --no-air        # hide the air-quality pane
+    sparktop --db PATH       # where the sqlite database lives
+    sparktop --no-db         # don't record anything
 
 If an air-quality Feather is plugged into USB, its readings show up in an
 "Air" pane. The board is found automatically via /dev/serial/by-id; point
 sparktop at a specific port with --air-device or $SPARKTOP_AIR_DEVICE.
+
+Every reading the board sends is also recorded in a local sqlite database,
+$SPARKTOP_DB or ~/.local/share/sparktop/sparktop.db by default.
 
 Override the nvidia-smi binary (handy for testing) with:
     SPARKTOP_NVIDIA_SMI=/path/to/fake-nvidia-smi sparktop
@@ -31,6 +36,7 @@ import pwd
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -618,6 +624,139 @@ def read_listeners(
 
 
 # ---------------------------------------------------------------------------
+# Local database (sqlite)
+# ---------------------------------------------------------------------------
+# sparktop keeps one small sqlite file so that what it sees outlives a run.
+# The air sensor is the only thing recorded so far: one row per line the
+# board sends, with the usual fields broken out into columns and the whole
+# JSON object kept alongside, so nothing the firmware adds later is lost.
+#
+# The file lives at $SPARKTOP_DB, or $XDG_DATA_HOME/sparktop/sparktop.db
+# (~/.local/share/sparktop/sparktop.db). Anything that goes wrong with it is
+# a warning at startup, never a reason for the monitor not to run.
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS air_readings (
+    id                INTEGER PRIMARY KEY,
+    at                REAL NOT NULL,   -- unix time the line arrived
+    src               TEXT,            -- which board, e.g. "feather-1"
+    seq               INTEGER,         -- the board's own publish counter
+    uptime_s          INTEGER,         -- seconds since the board booted
+    co2               REAL,            -- ppm
+    temperature       REAL,            -- °C
+    relative_humidity REAL,            -- %
+    pm1p0             REAL,            -- µg/m³
+    pm2p5             REAL,
+    pm4p0             REAL,
+    pm10p0            REAL,
+    voc_index         REAL,            -- Sensirion index, 1-500
+    nox_index         REAL,
+    raw               TEXT NOT NULL    -- the JSON object as sent
+);
+CREATE INDEX IF NOT EXISTS air_readings_at ON air_readings (at);
+"""
+DB_SCHEMA_VERSION = 1
+
+# column -> key in the board's JSON
+AIR_DB_COLUMNS = {
+    "src": "src",
+    "seq": "seq",
+    "uptime_s": "uptime_s",
+    "co2": "co2",
+    "temperature": "temperature",
+    "relative_humidity": "relative_humidity",
+    "pm1p0": "mass_concentration_pm1p0",
+    "pm2p5": "mass_concentration_pm2p5",
+    "pm4p0": "mass_concentration_pm4p0",
+    "pm10p0": "mass_concentration_pm10p0",
+    "voc_index": "voc_index",
+    "nox_index": "nox_index",
+}
+
+
+def default_db_path() -> str:
+    env = os.environ.get("SPARKTOP_DB")
+    if env:
+        return env
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "sparktop", "sparktop.db")
+
+
+class Db:
+    """The local sqlite database.
+
+    Writes are one INSERT per sensor publish (every 30s), so there is no
+    batching to speak of. WAL mode plus a busy timeout lets a second sparktop,
+    or a `sqlite3` shell poking at history, coexist with the writer. Once a
+    statement fails the connection is dropped and every later call is a
+    no-op — the dashboard must keep drawing whatever the disk is doing.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._conn: sqlite3.Connection | None = None
+
+    def open(self) -> str | None:
+        """Connect and migrate. Returns an error message instead of raising."""
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            conn = sqlite3.connect(self.path, timeout=1.0, isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(DB_SCHEMA)
+            conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+        except (OSError, sqlite3.Error) as e:
+            return f"{self.path}: {e}"
+        self._conn = conn
+        return None
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+        self._conn = None
+
+    def _run(self, sql: str, params: tuple = ()) -> sqlite3.Cursor | None:
+        if self._conn is None:
+            return None
+        try:
+            return self._conn.execute(sql, params)
+        except sqlite3.Error:
+            self.close()  # disk full, file deleted under us, ...: stop trying
+            return None
+
+    # -- air ----------------------------------------------------------------
+    def latest_air(self) -> tuple[dict | None, float]:
+        """The newest reading and when it arrived, or (None, 0.0)."""
+        cur = self._run("SELECT at, raw FROM air_readings ORDER BY at DESC LIMIT 1")
+        row = cur.fetchone() if cur is not None else None
+        if row:
+            try:
+                reading = json.loads(row[1])
+                if isinstance(reading, dict):
+                    return reading, float(row[0])
+            except (ValueError, TypeError):
+                pass
+        return None, 0.0
+
+    def insert_air(self, reading: dict, at: float) -> None:
+        cols = list(AIR_DB_COLUMNS)
+        vals = []
+        for col, key in AIR_DB_COLUMNS.items():
+            v = reading.get(key)
+            want = str if col == "src" else (int, float)
+            if isinstance(v, bool) or not isinstance(v, want):
+                v = None  # wrong shape for the column; still in `raw`
+            vals.append(v)
+        self._run(
+            f"INSERT INTO air_readings (at, {', '.join(cols)}, raw) "
+            f"VALUES (?, {', '.join('?' * len(cols))}, ?)",
+            (at, *vals, json.dumps(reading, separators=(",", ":"))),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Air-quality sensor (USB serial)
 # ---------------------------------------------------------------------------
 # An Adafruit Feather ESP32-S3 running the room-monitor firmware prints one
@@ -645,40 +784,6 @@ AIR_KEYS = frozenset(
 AIR_STALE_AFTER = 95.0
 
 
-def _air_cache_path() -> str:
-    """Where the last reading is parked between runs."""
-    import tempfile
-
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return os.path.join(base, f"sparktop-air-{os.getuid()}.json")
-
-
-def _air_cache_read() -> tuple[dict | None, float]:
-    try:
-        with open(_air_cache_path(), encoding="utf-8") as fh:
-            blob = json.load(fh)
-        reading = blob["reading"]
-        if isinstance(reading, dict):
-            return reading, float(blob["at"])
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return None, 0.0
-
-
-def _air_cache_write(reading: dict, at: float) -> None:
-    path = _air_cache_path()
-    tmp = f"{path}.{os.getpid()}"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"at": at, "reading": reading}, fh)
-        os.replace(tmp, path)  # atomic: a concurrent reader sees one or other
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
 def _air_num(reading: dict, key: str) -> float | None:
     v = reading.get(key)
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -689,9 +794,10 @@ class AirReader:
 
     There is nothing to poll: the board talks once every 30 seconds, so a
     frame just drains whatever the kernel has buffered for us and keeps the
-    newest complete line. Readings survive a restart through a small cache
-    file, which is what makes `--once` useful — a freshly opened port shows
-    nothing at all until the board's next publish, up to 30s later.
+    newest complete line. Every line is recorded in the database, and the
+    newest row is picked up again on start — which is what makes `--once`
+    useful, since a freshly opened port shows nothing at all until the
+    board's next publish, up to 30s later.
 
     Read-only and hands-off: the port is opened O_RDONLY with CLOCAL set, so
     running this alongside a serial monitor is fine and the board is never
@@ -700,12 +806,13 @@ class AirReader:
 
     RETRY = 5.0  # how often to go looking for the port again once it's gone
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, db: Db | None = None):
         self._device = device  # explicit path, or None to auto-detect
+        self._db = db
         self._fd: int | None = None
         self._buf = b""
         self._probed = 0.0
-        self._reading, self._at = _air_cache_read()
+        self._reading, self._at = db.latest_air() if db else (None, 0.0)
 
     # -- the port -----------------------------------------------------------
     def _discover(self) -> str | None:
@@ -785,7 +892,8 @@ class AirReader:
         if not isinstance(obj, dict) or not AIR_KEYS & obj.keys():
             return
         self._reading, self._at = obj, time.time()
-        _air_cache_write(obj, self._at)
+        if self._db is not None:
+            self._db.insert_air(obj, self._at)
 
     # -- the reading --------------------------------------------------------
     def sample(self) -> Air | None:
@@ -1256,10 +1364,12 @@ class Extras:
         want_services: bool,
         port_ranges: list[tuple[int, int]] | None,
         air: AirReader | None = None,
+        db: Db | None = None,
     ):
         self.want_services = want_services
         self.port_ranges = port_ranges
         self.air = air
+        self.db = db
         self.services: list[Service] | None = None
         self.docker_ports: dict[int, str] = {}
         self.docker_names: dict[str, str] = {}
@@ -1268,6 +1378,8 @@ class Extras:
     def close(self) -> None:
         if self.air is not None:
             self.air.close()
+        if self.db is not None:
+            self.db.close()
 
     def sample(self) -> tuple[list[Service] | None, list[Listener] | None, Air | None]:
         now = time.monotonic()
@@ -1434,6 +1546,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="hide the air-quality pane",
     )
+    p.add_argument(
+        "--db",
+        default=default_db_path(),
+        metavar="PATH",
+        help=(
+            "sqlite database that air readings are recorded in "
+            "(default: $SPARKTOP_DB, else ~/.local/share/sparktop/sparktop.db)"
+        ),
+    )
+    p.add_argument(
+        "--no-db",
+        action="store_true",
+        help="don't record anything (readings then won't survive a restart)",
+    )
     args = p.parse_args(argv)
 
     if args.no_color or not sys.stdout.isatty():
@@ -1447,10 +1573,19 @@ def main(argv: list[str] | None = None) -> int:
             ranges = parse_port_spec(args.ports)
         except ValueError as e:
             p.error(str(e))
+    db = None
+    if not args.no_db:
+        db = Db(args.db)
+        err = db.open()
+        if err:
+            # Before the alt screen goes up, so it's actually seen.
+            print(f"sparktop: database unavailable, not recording: {err}", file=sys.stderr)
+            db = None
     extras = Extras(
         want_services=not args.no_services,
         port_ranges=ranges,
-        air=None if args.no_air else AirReader(args.air_device),
+        air=None if args.no_air else AirReader(args.air_device, db),
+        db=db,
     )
 
     signal.signal(signal.SIGINT, signal.default_int_handler)
