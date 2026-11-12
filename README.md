@@ -27,6 +27,9 @@ sparktop --once     # print one snapshot and exit (scriptable, no ANSI when pipe
 sparktop --no-color # disable color
 sparktop --serve 7781             # the same snapshot as JSON on http://127.0.0.1:7781/
 sparktop --serve 100.x.y.z:7781   # ...on one address, e.g. this host's tailnet one
+                                  # GET /air?hours=12&points=64 there is the air sensor's
+                                  # history (averages per span, null where nothing was read);
+                                  # while serving, the sensor is recorded all the time
 
 sparktop --ports 3000-3009,8080,25565   # which ports to watch
 sparktop --no-ports        # hide the ports pane

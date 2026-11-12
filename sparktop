@@ -1086,6 +1086,18 @@ AIR_DB_COLUMNS = {
 }
 
 
+# name in the history answer -> column
+AIR_HISTORY_COLUMNS = {
+    "co2": "co2",
+    "temp": "temperature",
+    "rh": "relative_humidity",
+    "pm2p5": "pm2p5",
+    "pm10": "pm10p0",
+    "voc": "voc_index",
+    "nox": "nox_index",
+}
+
+
 def default_db_path() -> str:
     env = os.environ.get("SPARKTOP_DB")
     if env:
@@ -1152,6 +1164,29 @@ class Db:
             except (ValueError, TypeError):
                 pass
         return None, 0.0
+
+    def air_history(self, since: float, until: float, points: int) -> dict[str, list]:
+        """Each column averaged over `points` equal spans of time, oldest first.
+
+        A span with no reading for a column is None there: a gap stays a gap.
+        """
+        step = (until - since) / points
+        out: dict[str, list] = {k: [None] * points for k in AIR_HISTORY_COLUMNS}
+        cur = self._run(
+            "SELECT CAST((at - ?) / ? AS INTEGER) AS b, "
+            # 6553.4 is the SEN55 saying "off the scale", not a measurement
+            + ", ".join(
+                f"AVG(CASE WHEN {c} < 6553 THEN {c} END)" if c.startswith("pm") else f"AVG({c})"
+                for c in AIR_HISTORY_COLUMNS.values()
+            )
+            + " FROM air_readings WHERE at >= ? AND at < ? GROUP BY b",
+            (since, step, since, until),
+        )
+        for row in cur.fetchall() if cur is not None else ():
+            if 0 <= row[0] < points:
+                for k, v in zip(AIR_HISTORY_COLUMNS, row[1:]):
+                    out[k][row[0]] = None if v is None else round(v, 1)
+        return out
 
     def insert_air(self, reading: dict, at: float) -> None:
         cols = list(AIR_DB_COLUMNS)
@@ -1977,15 +2012,37 @@ def snapshot(extras: Extras) -> dict:
     return out
 
 
+def air_history(extras: Extras, hours: float, points: int) -> dict:
+    """The air sensor's last `hours`, averaged into `points` spans (GET /air)."""
+    hours = min(max(hours, 0.1), 24 * 14)
+    points = min(max(points, 1), 1440)
+    now = time.time()
+    air = extras.air.sample() if extras.air else None
+    out: dict = {"at": int(now), "hours": hours, "step": round(hours * 3600 / points, 1)}
+    if air is not None and not air.pending:
+        out["now"] = {
+            "age": round(air.age), "stale": air.stale, "co2": air.co2, "temp": air.temp,
+            "rh": air.rh, "pm2p5": air.pm2p5, "pm10": air.pm10, "voc": air.voc, "nox": air.nox,
+        }
+    if extras.db is not None:
+        out.update(extras.db.air_history(now - hours * 3600, now, points))
+    return out
+
+
 def run_serve(spec: str, extras: Extras) -> int:
     """Answer GET / with the snapshot as JSON, for a client that isn't a terminal.
 
-    Read-only, and nothing is sampled until someone asks; a snapshot is kept
-    for a second so a few clients polling together cost one nvidia-smi.
+    GET /air?hours=12&points=64 is the air sensor's history from the database.
+    Read-only. The snapshot is sampled only when someone asks, and kept for a
+    second so a few clients polling together cost one nvidia-smi; the air
+    sensor is the exception, read every few seconds whoever is asking, since
+    it is the one thing here being recorded and the kernel keeps only a few
+    minutes of what the board said.
     One request at a time, on this thread: the database connection and the
     serial port belong to it.
     """
     import http.server
+    import urllib.parse
 
     host, _, port = spec.rpartition(":")
     cache: dict = {"at": 0.0, "body": b""}
@@ -1994,13 +2051,27 @@ def run_serve(spec: str, extras: Extras) -> int:
         timeout = 5  # a client that stalls doesn't hold the others up for long
 
         def do_GET(self) -> None:
-            if self.path.split("?")[0] not in ("/", "/snapshot"):
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/air":
+                q = urllib.parse.parse_qs(url.query)
+                try:
+                    hours = float(q.get("hours", ["12"])[0])
+                    points = int(q.get("points", ["72"])[0])
+                except ValueError:
+                    self.send_error(400)
+                    return
+                if hours != hours:  # nan
+                    self.send_error(400)
+                    return
+                body = json.dumps(air_history(extras, hours, points), separators=(",", ":")).encode()
+            elif url.path in ("/", "/snapshot"):
+                if time.monotonic() - cache["at"] >= 1.0:
+                    cache["body"] = json.dumps(snapshot(extras), separators=(",", ":")).encode()
+                    cache["at"] = time.monotonic()
+                body = cache["body"]
+            else:
                 self.send_error(404)
                 return
-            if time.monotonic() - cache["at"] >= 1.0:
-                cache["body"] = json.dumps(snapshot(extras), separators=(",", ":")).encode()
-                cache["at"] = time.monotonic()
-            body = cache["body"]
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -2010,8 +2081,18 @@ def run_serve(spec: str, extras: Extras) -> int:
         def log_message(self, *a) -> None:
             pass
 
+    class Server(http.server.HTTPServer):
+        AIR_EVERY = 5.0
+        _air_at = 0.0
+
+        def service_actions(self) -> None:  # between requests, about twice a second
+            now = time.monotonic()
+            if extras.air is not None and now - self._air_at >= self.AIR_EVERY:
+                self._air_at = now
+                extras.air.sample()
+
     try:
-        srv = http.server.HTTPServer((host or "127.0.0.1", int(port)), Handler)
+        srv = Server((host or "127.0.0.1", int(port)), Handler)
     except (OSError, ValueError) as e:
         print(f"sparktop: can't serve on {spec}: {e}", file=sys.stderr)
         return 1
