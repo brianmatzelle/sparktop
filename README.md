@@ -25,6 +25,8 @@ sparktop            # live dashboard, refresh every 1s  (q or Ctrl-C to quit)
 sparktop -n 2       # refresh every 2 seconds
 sparktop --once     # print one snapshot and exit (scriptable, no ANSI when piped)
 sparktop --no-color # disable color
+sparktop --serve 7781             # the same snapshot as JSON on http://127.0.0.1:7781/
+sparktop --serve 100.x.y.z:7781   # ...on one address, e.g. this host's tailnet one
 
 sparktop --ports 3000-3009,8080,25565   # which ports to watch
 sparktop --no-ports        # hide the ports pane
