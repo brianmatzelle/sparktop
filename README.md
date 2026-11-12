@@ -36,6 +36,10 @@ sparktop --no-ports        # hide the ports pane
 sparktop --no-services     # hide the services pane
 
 sparktop --air-device /dev/ttyACM0   # air sensor's serial port
+sparktop --air-udp 0                 # don't also listen for the sensor's WiFi broadcast
+                                     # (UDP 7779 by default: a board on a wall plug on the
+                                     # same subnet is heard that way; a reading that
+                                     # arrives both ways is recorded once)
 sparktop --no-air          # hide the air-quality pane
 sparktop --no-llms         # hide the local-LLMs pane
 

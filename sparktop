@@ -1189,6 +1189,16 @@ class Db:
         return out
 
     def insert_air(self, reading: dict, at: float) -> None:
+        # One publish can arrive twice: by USB and by broadcast, or in two
+        # sparktops at once. The board's name and uptime say it is the same.
+        src, up = reading.get("src"), reading.get("uptime_s")
+        if isinstance(src, str) and isinstance(up, int) and not isinstance(up, bool):
+            cur = self._run(
+                "SELECT 1 FROM air_readings WHERE at > ? AND src = ? AND uptime_s = ? LIMIT 1",
+                (at - 120, src, up),
+            )
+            if cur is not None and cur.fetchone():
+                return
         cols = list(AIR_DB_COLUMNS)
         vals = []
         for col, key in AIR_DB_COLUMNS.items():
@@ -1215,6 +1225,7 @@ class Db:
 # A field the sensor can't vouch for is omitted rather than sent as zero, so a
 # missing key means "warming up", not "measured zero" — hence `n/a` and not 0
 # wherever a key is absent below.
+AIR_UDP_PORT = 7779  # broadcast.port in the firmware's config.yaml
 AIR_BAUD = 115200  # sensor.serial_baud in the firmware's config.yaml
 
 # Auto-detection only ever opens a port whose by-id name says it is one of
@@ -1254,9 +1265,21 @@ class AirReader:
 
     RETRY = 5.0  # how often to go looking for the port again once it's gone
 
-    def __init__(self, device: str | None = None, db: Db | None = None):
+    def __init__(self, device: str | None = None, db: Db | None = None, udp_port: int = 0):
         self._device = device  # explicit path, or None to auto-detect
         self._db = db
+        # A board on WiFi broadcasts the same JSON to the subnet, so one that
+        # is plugged into a wall rather than this machine is heard that way.
+        self._udp: socket.socket | None = None
+        if udp_port:
+            try:
+                u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # a second sparktop hears it too
+                u.bind(("", udp_port))
+                u.setblocking(False)
+                self._udp = u
+            except OSError:
+                self._udp = None  # the port is taken: USB only
         self._fd: int | None = None
         self._buf = b""
         self._probed = 0.0
@@ -1308,6 +1331,9 @@ class AirReader:
             except OSError:
                 pass
         self._fd, self._buf = None, b""
+        if self._udp is not None:
+            self._udp.close()
+            self._udp = None
 
     # -- the bytes ----------------------------------------------------------
     def _drain(self) -> None:
@@ -1339,9 +1365,26 @@ class AirReader:
             return
         if not isinstance(obj, dict) or not AIR_KEYS & obj.keys():
             return
+        last = self._reading
+        if (
+            last is not None
+            and obj.get("uptime_s") is not None
+            and (obj.get("src"), obj.get("uptime_s")) == (last.get("src"), last.get("uptime_s"))
+        ):
+            return  # the same publish again, by the other route
         self._reading, self._at = obj, time.time()
         if self._db is not None:
             self._db.insert_air(obj, self._at)
+
+    def _drain_udp(self) -> None:
+        while self._udp is not None:
+            try:
+                data = self._udp.recv(2048)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            self._feed(data)
 
     # -- the reading --------------------------------------------------------
     def sample(self) -> Air | None:
@@ -1351,6 +1394,7 @@ class AirReader:
             self._open()
         if self._fd is not None:
             self._drain()
+        self._drain_udp()
 
         if self._reading is None:
             # Port open but the board hasn't spoken yet: say so, rather than
@@ -2237,6 +2281,17 @@ def main(argv: list[str] | None = None) -> int:
         help="hide the systemd services pane",
     )
     p.add_argument(
+        "--air-udp",
+        type=int,
+        default=int(os.environ.get("SPARKTOP_AIR_UDP", AIR_UDP_PORT)),
+        metavar="PORT",
+        help=(
+            "also hear the sensor's WiFi broadcast on this UDP port, for a board "
+            f"that isn't plugged in here (default: {AIR_UDP_PORT}; 0 = USB only; "
+            "$SPARKTOP_AIR_UDP)"
+        ),
+    )
+    p.add_argument(
         "--air-device",
         default=os.environ.get("SPARKTOP_AIR_DEVICE"),
         metavar="PATH",
@@ -2294,7 +2349,7 @@ def main(argv: list[str] | None = None) -> int:
         want_services=not args.no_services,
         port_ranges=ranges,
         want_llms=not args.no_llms,
-        air=None if args.no_air else AirReader(args.air_device, db),
+        air=None if args.no_air else AirReader(args.air_device, db, args.air_udp),
         db=db,
     )
 
