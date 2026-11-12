@@ -13,8 +13,12 @@ Usage:
     sparktop --no-services   # hide the systemd services pane
     sparktop --no-ports      # hide the listening-ports pane
     sparktop --no-air        # hide the air-quality pane
+    sparktop --no-llms       # hide the local-LLMs pane
     sparktop --db PATH       # where the sqlite database lives
     sparktop --no-db         # don't record anything
+
+Model servers running on the box (llama.cpp, ollama, vLLM, ...) show up in
+an "LLMs" pane, with what each is serving and whether it's busy right now.
 
 If an air-quality Feather is plugged into USB, its readings show up in an
 "Air" pane. The board is found automatically via /dev/serial/by-id; point
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import http.client
 import json
 import os
 import pwd
@@ -40,7 +45,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 NVIDIA_SMI = os.environ.get("SPARKTOP_NVIDIA_SMI", "nvidia-smi")
 
@@ -206,6 +211,45 @@ class Air:
     @property
     def stale(self) -> bool:
         return self.age > AIR_STALE_AFTER
+
+
+@dataclass
+class Docker:
+    """What `docker ps` says about the running containers (see read_docker)."""
+    ports: dict[int, str] = field(default_factory=dict)  # published host port -> name
+    names: dict[str, str] = field(default_factory=dict)  # container id -> name
+    # name -> {container port: (host address, host port)}, tcp only
+    forwards: dict[str, dict[int, tuple[str, int]]] = field(default_factory=dict)
+    host_net: set[str] = field(default_factory=set)  # `network_mode: host` containers
+
+
+@dataclass
+class LlmServer:
+    """A model-serving process, found by its command line (see find_llm_servers)."""
+    engine: str                   # "llama.cpp", "ollama", "vLLM", ...
+    pid: str
+    model: str | None             # None when it's picked at runtime (ollama)
+    addr: tuple[str, int] | None  # where its API answers from this host
+    unit: str | None              # owning systemd unit
+    container: str | None         # owning docker container
+    pids: set[str]                # the server and everything it spawned
+
+
+@dataclass
+class Llm:
+    """One row of the LLMs pane: a model, as it's being served right now."""
+    server: LlmServer
+    model: str | None
+    mem: float | None        # MiB
+    state: str               # "busy" | "idle" | "loading" | "loaded" | "running"
+    busy: int | None = None  # requests in flight, when the server says
+    slots: int | None = None  # how many it can take at once (llama.cpp)
+
+    @property
+    def label(self) -> str:
+        if self.model:
+            return self.model
+        return "(no model loaded)" if self.server.engine == "ollama" else "?"
 
 
 class SmiError(Exception):
@@ -545,33 +589,58 @@ def username(uid: int) -> str:
         return f"uid{uid}"
 
 
-def read_docker() -> tuple[dict[int, str], dict[str, str]]:
-    """Ask docker for (published host port -> name, container id -> name).
+# "0.0.0.0:25567->8080/tcp", or a run of them: "[::]:8000-8002->8000-8002/tcp".
+DOCKER_PUBLISHED = re.compile(
+    r"(\[[^\]]+\]|[\d.]+):(\d+)(?:-(\d+))?->(\d+)(?:-\d+)?/(\w+)"
+)
 
-    Both are needed because containers reach the host's ports two ways:
+
+def read_docker() -> Docker:
+    """Ask docker which containers are running and what they publish.
+
+    Both maps are needed because containers reach the host's ports two ways:
     a published port is proxied by a root-owned docker-proxy, so only the port
     number identifies it; a `network_mode: host` container instead listens on
     the host directly, so its own PID's cgroup names it — if ss can see it.
+    The LLMs pane goes the other way, from a port inside a container to the
+    one it's published on.
     """
     text = _run(
-        ["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Ports}}"],
+        [
+            "docker", "ps", "--no-trunc", "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Networks}}\t{{.Ports}}",
+        ],
         timeout=3.0,
     )
+    docker = Docker()
     if not text:
-        return {}, {}
-    ports: dict[int, str] = {}
-    names: dict[str, str] = {}
+        return docker
     for line in text.splitlines():
-        cid, _, rest = line.partition("\t")
-        name, _, portspec = rest.partition("\t")
+        cid, name, networks, portspec = (line.split("\t") + ["", "", ""])[:4]
         if not name:
             continue
-        names[cid] = name
-        # Published ports look like "0.0.0.0:25567->8080/tcp"; bare "5001/tcp"
-        # is merely exposed and isn't listening on the host.
-        for m in re.finditer(r"(?:\[[^\]]+\]|[\d.]+):(\d+)->", portspec):
-            ports.setdefault(int(m.group(1)), name)
-    return ports, names
+        docker.names[cid] = name
+        if networks == "host":
+            docker.host_net.add(name)
+        # Bare "5001/tcp" is merely exposed and isn't listening on the host,
+        # so only the "host:port->port" form counts.
+        for m in DOCKER_PUBLISHED.finditer(portspec):
+            host = m.group(1).strip("[]")
+            if host in ("0.0.0.0", "::"):  # a wildcard answers on loopback too
+                host = "::1" if host == "::" else "127.0.0.1"
+            lo = int(m.group(2))
+            hi = int(m.group(3) or lo)
+            inner = int(m.group(4))
+            for i, port in enumerate(range(lo, hi + 1)):
+                docker.ports.setdefault(port, name)
+                if m.group(5) != "tcp":
+                    continue
+                fwd = docker.forwards.setdefault(name, {})
+                # Published on several addresses: loopback is the one to use.
+                have = fwd.get(inner + i)
+                if have is None or (_loopback(host) and not _loopback(have[0])):
+                    fwd[inner + i] = (host, port)
+    return docker
 
 
 def read_listeners(
@@ -621,6 +690,349 @@ def read_listeners(
             lis.container = docker_ports[port]
         lis.uid = uids.get((proto, port))
     return sorted(found.values(), key=lambda l: (l.port, l.proto))
+
+
+# ---------------------------------------------------------------------------
+# Local LLM servers
+# ---------------------------------------------------------------------------
+# A model server is recognised by the program it runs, never by a word turning
+# up somewhere in a command line — `grep llama-server` or `vim vllm.md` is not
+# a model. The program is a binary's name, a Python script's, or the module
+# behind `python -m` (see _program). A key with a space in it also needs the
+# subcommand: `ollama serve` is the server, `ollama run` just a client of it.
+#
+# The port is the engine's default, for when the command line doesn't give
+# one; None means the program has no API to ask.
+LLM_PROGRAMS: dict[str, tuple[str, int | None]] = {
+    "llama-server": ("llama.cpp", 8080),
+    "llama-cli": ("llama.cpp", None),
+    "llama_cpp.server": ("llama-cpp-python", 8000),
+    "ollama serve": ("ollama", 11434),
+    "vllm serve": ("vLLM", 8000),
+    "vllm.entrypoints.openai.api_server": ("vLLM", 8000),
+    "sglang.launch_server": ("SGLang", 30000),
+    "trtllm-serve serve": ("TensorRT-LLM", 8000),
+    "trtllm-serve": ("TensorRT-LLM", 8000),
+    "text-generation-launcher": ("TGI", 3000),
+    "koboldcpp": ("KoboldCpp", 5001),
+}
+
+# Flags that name the model, across the engines above.
+LLM_MODEL_FLAGS = ("-m", "--model", "--model-path", "--model-id", "-hf", "--hf-repo")
+
+# Long enough for a server on loopback, short enough not to hold up a frame.
+LLM_PROBE_TIMEOUT = 0.3
+
+PYTHON = re.compile(r"python[\d.]*")
+
+
+def _program(argv: list[str]) -> tuple[str, list[str]] | None:
+    """Name the program a command line runs, and the arguments it was given.
+
+    `python -m vllm.entrypoints.openai.api_server` runs that module and
+    `python /usr/local/bin/vllm serve` runs `vllm`, so for an interpreter the
+    program is the module or the script, not python itself.
+    """
+    if not argv:
+        return None  # kernel thread
+    prog, args = os.path.basename(argv[0]), argv[1:]
+    if not PYTHON.fullmatch(prog):
+        return prog, args
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-m":
+            return (args[i + 1], args[i + 2 :]) if i + 1 < len(args) else None
+        if args[i] == "-c":
+            return None  # inline code, e.g. multiprocessing's spawn_main
+        i += 2 if args[i] in ("-W", "-X") else 1
+    if i == len(args):
+        return None  # a bare REPL
+    return os.path.basename(args[i]).removesuffix(".py"), args[i + 1 :]
+
+
+def _flag(args: list[str], names: tuple[str, ...]) -> str | None:
+    """The value given for any of `names`, as `--name v` or `--name=v`."""
+    for i, a in enumerate(args):
+        name, eq, val = a.partition("=")
+        if name in names:
+            if eq:
+                return val
+            if i + 1 < len(args):
+                return args[i + 1]
+    return None
+
+
+def _model_name(spec: str) -> str:
+    """A short name for a model path or repo id.
+
+    "/models/x/Qwen3-8B-Q4_K_M.gguf" and "Qwen/Qwen3-8B" are both best
+    known by their last part; split GGUFs drop their "-00001-of-00003" too.
+    """
+    name = os.path.basename(spec.rstrip("/")) or spec
+    return re.sub(r"(-\d{5}-of-\d{5})?\.gguf$", "", name, flags=re.I)
+
+
+def _llm_match(argv: list[str]) -> tuple[str, str | None, str | None, int | None] | None:
+    """(engine, model, host, port) if this command line is a model server."""
+    prog = _program(argv)
+    if prog is None:
+        return None
+    name, args = prog
+    if args and f"{name} {args[0]}" in LLM_PROGRAMS:
+        engine, port = LLM_PROGRAMS[f"{name} {args[0]}"]
+        args = args[1:]
+    elif name in LLM_PROGRAMS:
+        engine, port = LLM_PROGRAMS[name]
+    else:
+        return None
+    model = _flag(args, LLM_MODEL_FLAGS)
+    if model is None and args and not args[0].startswith("-"):
+        model = args[0]  # positional, as in `vllm serve Qwen/Qwen3-8B`
+    if port is not None:
+        try:
+            port = int(_flag(args, ("--port",)) or port)
+        except ValueError:
+            pass
+    host = _flag(args, ("--host",))
+    return engine, (_model_name(model) if model else None), host, port
+
+
+def _proc_table() -> dict[str, tuple[str, list[str]]] | None:
+    """pid -> (parent pid, argv) for every process we can see.
+
+    Both files are world-readable, so root's servers — anything in a
+    container, say — are found as readily as our own.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    table: dict[str, tuple[str, list[str]]] = {}
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue  # exited while we looked
+        # The process name comes first, in parentheses that it can contain.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 2:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        table[pid] = (fields[1], argv)
+    return table
+
+
+def _llm_addr(
+    host: str | None, port: int | None, container: str | None, docker: Docker
+) -> tuple[str, int] | None:
+    """Where a server's API answers from this host, or None if it can't be reached.
+
+    A server in its own network namespace listens on a port only the
+    container can see, so what we want is where that port is published.
+    """
+    if port is None:
+        return None
+    if container is None or container in docker.host_net:
+        if not host or host in ("0.0.0.0", "::", "*"):
+            host = "127.0.0.1"
+        return host, port
+    return docker.forwards.get(container, {}).get(port)
+
+
+def find_llm_servers(docker: Docker) -> list[LlmServer] | None:
+    table = _proc_table()
+    if table is None:
+        return None  # no /proc: not Linux
+    found = {pid: m for pid, (_, argv) in table.items() if (m := _llm_match(argv))}
+    children: dict[str, list[str]] = {}
+    for pid, (ppid, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+
+    servers = []
+    for pid, (engine, model, host, port) in found.items():
+        # A server that another one started is part of it, not a second model.
+        ppid, seen = table[pid][0], set()
+        while ppid in table and ppid not in found and ppid not in seen:
+            seen.add(ppid)
+            ppid = table[ppid][0]
+        if ppid in found:
+            continue
+        # Its children too: vLLM's GPU memory belongs to an engine process it
+        # spawns, and ollama loads each model into a runner of its own.
+        pids, todo = {pid}, [pid]
+        while todo:
+            for c in children.get(todo.pop(), ()):
+                if c not in pids:
+                    pids.add(c)
+                    todo.append(c)
+        unit, cid = cgroup_owner(pid)
+        container = None
+        if cid:
+            container = docker.names.get(cid) or docker.names.get(cid[:12]) or cid[:12]
+        servers.append(
+            LlmServer(
+                engine=engine,
+                pid=pid,
+                model=model,
+                addr=_llm_addr(host, port, container, docker),
+                unit=unit,
+                container=container,
+                pids=pids,
+            )
+        )
+    return servers
+
+
+def _http_get(addr: tuple[str, int], path: str) -> tuple[int, bytes] | None:
+    """GET a model server's API: (status, body), or None if nothing answered.
+
+    A timeout is raised rather than swallowed, since for llama.cpp being too
+    busy to answer is itself the answer. http.client rather than urllib, so a
+    $http_proxy meant for the outside world never gets in the way.
+    """
+    conn = http.client.HTTPConnection(addr[0], addr[1], timeout=LLM_PROBE_TIMEOUT)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, resp.read(1 << 20)
+    except TimeoutError:
+        raise
+    except (OSError, http.client.HTTPException):
+        return None  # refused, reset, or not speaking HTTP
+    finally:
+        conn.close()
+
+
+def _json(body: bytes) -> object:
+    try:
+        return json.loads(body)
+    except ValueError:
+        return None
+
+
+def _probe_llamacpp(addr: tuple[str, int]) -> tuple[str, int | None, int | None]:
+    """llama-server: (state, slots busy, slots) from /slots."""
+    try:
+        got = _http_get(addr, "/slots")
+    except TimeoutError:
+        # /slots is answered between batches, so the usual reason for no
+        # answer in time is a long prompt being chewed through.
+        return "busy", None, None
+    if got is None:
+        return "running", None, None
+    status, body = got
+    if status == 503:
+        return "loading", None, None  # every endpoint says so until it's up
+    slots = _json(body) if status == 200 else None
+    if isinstance(slots, list) and slots:
+        # `is_processing` since late 2024; before that, `state` 1 = processing.
+        n = sum(
+            1 for s in slots
+            if isinstance(s, dict) and (s.get("is_processing") or s.get("state") == 1)
+        )
+        return ("busy" if n else "idle"), n, len(slots)
+    return "running", None, None  # started with --no-slots
+
+
+def _probe_vllm(addr: tuple[str, int]) -> tuple[str, int | None, int | None]:
+    """vLLM: (state, requests running, None) from its Prometheus /metrics."""
+    try:
+        got = _http_get(addr, "/metrics")
+    except TimeoutError:
+        got = None
+    if got is None or got[0] != 200:
+        return "running", None, None
+    running, seen = 0.0, False
+    for line in got[1].decode("utf-8", "replace").splitlines():
+        name, brace, _ = line.partition("{")
+        if name.partition(" ")[0] != "vllm:num_requests_running":
+            continue
+        # `name{labels} value`, one per engine; the labels may hold spaces.
+        value = line.rpartition("}")[2] if brace else line.partition(" ")[2]
+        try:
+            running += float(value.split()[0])
+            seen = True
+        except (ValueError, IndexError):
+            continue
+    if not seen:
+        return "running", None, None
+    n = int(running)
+    return ("busy" if n else "idle"), n, None
+
+
+LLM_PROBES = {"llama.cpp": _probe_llamacpp, "vLLM": _probe_vllm}
+
+
+def _ollama_rows(s: LlmServer, mem: float | None) -> list[Llm]:
+    """One row per model ollama has loaded, from /api/ps.
+
+    Its runners don't name the model they hold (they're given a blob path),
+    so the API is the only way to say what's in memory.
+    """
+    try:
+        got = _http_get(s.addr, "/api/ps") if s.addr else None
+    except TimeoutError:
+        got = None
+    ps = _json(got[1]) if got and got[0] == 200 else None
+    models = ps.get("models") if isinstance(ps, dict) else None
+    if not isinstance(models, list):
+        return [Llm(s, None, mem, "running")]
+    if not models:
+        return [Llm(s, None, mem, "idle")]
+    rows = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        size = m.get("size")
+        rows.append(
+            Llm(
+                s,
+                str(m.get("name") or m.get("model") or "?"),
+                size / 2**20 if isinstance(size, (int, float)) else None,
+                "loaded",
+            )
+        )
+    return rows
+
+
+def _rss_mib(pid: str) -> float | None:
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def read_llms(servers: list[LlmServer], procs: list[Proc]) -> list[Llm]:
+    """Ask each server what it's doing; one row per model it serves.
+
+    Memory is what nvidia-smi charges to the server and its children, which
+    on the Spark's unified memory is the model's real footprint. A server
+    with nothing on the GPU (CPU inference) falls back to its RSS.
+    """
+    gpu = {p.pid: p.mem for p in procs if p.mem is not None}
+    rows: list[Llm] = []
+    for s in servers:
+        used = [gpu[p] for p in s.pids if p in gpu]
+        mem = sum(used) if used else _rss_mib(s.pid)
+        if s.engine == "ollama":
+            rows += _ollama_rows(s, mem)
+            continue
+        probe = LLM_PROBES.get(s.engine)
+        state, busy, slots = probe(s.addr) if probe and s.addr else ("running", None, None)
+        rows.append(Llm(s, s.model, mem, state, busy, slots))
+    # Biggest first, and not busy first: rows that swapped places every time
+    # a request came and went would be hard to follow.
+    rows.sort(key=lambda m: (-(m.mem or 0), m.label))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1514,95 @@ def air_section(air: Air, width: int, narrow: bool) -> list[str]:
     return lines
 
 
+def _elide(text: str, width: int) -> str:
+    """Shorten from the middle, where a model name says least: the family
+    is at the front and the quantisation at the back."""
+    if len(text) <= width:
+        return text
+    if width < 3:
+        return text[: max(0, width)]
+    head = width // 2
+    return text[:head] + "…" + text[len(text) - (width - head - 1) :]
+
+
+def _llm_state(m: Llm) -> tuple[str, str, str]:
+    """(glyph colour, state word, word colour) for one model."""
+    if m.state == "busy":
+        word = "busy"
+        if m.busy is not None:
+            word += f" {m.busy}/{m.slots}" if m.slots else f" {m.busy}"
+        return C.GREEN, word, C.GREEN
+    if m.state == "loading":
+        return C.YELLOW, "loading", C.YELLOW
+    return C.GREEN, m.state, C.GREY  # up and waiting: idle / loaded / running
+
+
+def llm_section(llms: list[Llm], width: int, narrow: bool) -> list[str]:
+    """Render the 'LLMs' pane — local model servers and what they're doing."""
+    models = sum(1 for m in llms if m.model)
+    busy = sum(1 for m in llms if m.state == "busy")
+    tally = f"{models} model" + ("" if models == 1 else "s")
+    if busy:
+        tally += f", {busy} busy"
+    lines = [C.wrap("LLMs", C.BOLD) + "  " + C.wrap(f"({tally})", C.GREY)]
+    states = {id(m): _llm_state(m) for m in llms}
+
+    def glyph(m: Llm) -> str:
+        return C.wrap("◐" if m.state == "loading" else "●", states[id(m)][0])
+
+    def name(m: Llm, w: int) -> str:
+        text = _elide(m.label, w)
+        return text if m.model else C.wrap(text, C.GREY)
+
+    if narrow:
+        lines.append(C.wrap("  MODEL  STATE", C.GREY))
+        for m in llms:
+            _, word, col = states[id(m)]
+            used = 4 + 1 + len(word)
+            lines.append(f"  {glyph(m)} {name(m, max(0, width - used))} " + C.wrap(word, col))
+        return lines
+
+    owners = {}
+    for m in llms:
+        s = m.server
+        if s.container:
+            owners[id(m)] = (s.container, " ·docker")
+        elif s.unit:
+            owners[id(m)] = (s.unit.removesuffix(".service"), "")
+        else:
+            owners[id(m)] = (f"pid {s.pid}", "")
+    ports = {id(m): str(m.server.addr[1]) if m.server.addr else "-" for m in llms}
+    eng_w = max(6, max(len(m.server.engine) for m in llms))          # >= "ENGINE"
+    state_w = max(5, max(len(states[id(m)][1]) for m in llms))       # >= "STATE"
+    mem_w = max(3, max(len(gib(m.mem)) for m in llms))               # >= "MEM"
+    port_w = max(4, max(len(p) for p in ports.values()))             # >= "PORT"
+    # The model column gets what's left once the others, and up to 20
+    # columns of owner, have their room.
+    rest = 4 + 2 + eng_w + 2 + state_w + 2 + mem_w + 2 + port_w + 2
+    owner_w = min(20, max(len(o) + len(t) for o, t in owners.values()))
+    model_w = max(5, min(max(len(m.label) for m in llms), width - rest - owner_w))
+    lines.append(
+        C.wrap(
+            f"    {'MODEL':<{model_w}}  {'ENGINE':<{eng_w}}  {'STATE':<{state_w}}  "
+            f"{'MEM':>{mem_w}}  {'PORT':>{port_w}}  OWNER",
+            C.GREY,
+        )
+    )
+    for m in llms:
+        _, word, col = states[id(m)]
+        owner, tag = owners[id(m)]
+        used = rest + model_w + len(tag)
+        lines.append(
+            f"  {glyph(m)} {name(m, model_w)}{' ' * (model_w - min(model_w, len(m.label)))}  "
+            f"{m.server.engine:<{eng_w}}  "
+            + C.wrap(f"{word:<{state_w}}", col)
+            + f"  {gib(m.mem):>{mem_w}}  {ports[id(m)]:>{port_w}}  "
+            + owner[: max(0, width - used)]
+            + C.wrap(tag, C.GREY)
+        )
+    return lines
+
+
 def _service_color(s: Service) -> str:
     if s.state == "failed":
         return C.RED
@@ -1225,6 +1726,7 @@ def render(
     services: list[Service] | None = None,
     listeners: list[Listener] | None = None,
     air: Air | None = None,
+    llms: list[Llm] | None = None,
 ) -> str:
     lines: list[str] = []
     host = os.uname().nodename
@@ -1308,6 +1810,10 @@ def render(
         # First of the secondary panes: it's the shortest of them, and a
         # room you have to leave outranks a service you can restart.
         blocks.append(air_section(air, width, narrow))
+    if llms:
+        # Only when something is serving: a row per model is short, and
+        # what's on the GPU is the next thing you'd ask a GPU monitor.
+        blocks.append(llm_section(llms, width, narrow))
     if services is not None:
         blocks.append(service_section(services, width, narrow))
     if listeners is not None:
@@ -1351,8 +1857,10 @@ def render(
 class Extras:
     """Samples the secondary panes, throttling the slow sources.
 
-    `ss` is cheap enough to run every frame, but the unit list and the docker
-    container list barely move at 1 Hz, so they're re-read on a TTL instead.
+    `ss` is cheap enough to run every frame, but the unit list, the docker
+    container list and the set of model servers barely move at 1 Hz, so
+    they're re-read on a TTL instead. Asking those servers whether they're
+    busy is a request to localhost each, and is done every frame.
     The air sensor needs no throttling of its own: draining a serial buffer
     that is nearly always empty costs one non-blocking read.
     """
@@ -1363,16 +1871,18 @@ class Extras:
         self,
         want_services: bool,
         port_ranges: list[tuple[int, int]] | None,
+        want_llms: bool = False,
         air: AirReader | None = None,
         db: Db | None = None,
     ):
         self.want_services = want_services
         self.port_ranges = port_ranges
+        self.want_llms = want_llms
         self.air = air
         self.db = db
         self.services: list[Service] | None = None
-        self.docker_ports: dict[int, str] = {}
-        self.docker_names: dict[str, str] = {}
+        self.docker = Docker()
+        self.llm_servers: list[LlmServer] | None = None
         self._stamp = 0.0
 
     def close(self) -> None:
@@ -1381,32 +1891,37 @@ class Extras:
         if self.db is not None:
             self.db.close()
 
-    def sample(self) -> tuple[list[Service] | None, list[Listener] | None, Air | None]:
+    def sample(
+        self, procs: list[Proc]
+    ) -> tuple[list[Service] | None, list[Listener] | None, Air | None, list[Llm] | None]:
         now = time.monotonic()
         if not self._stamp or now - self._stamp >= self.TTL:
             self._stamp = now
             if self.want_services:
                 self.services = read_services()
-            if self.port_ranges is not None:
-                self.docker_ports, self.docker_names = read_docker()
+            if self.port_ranges is not None or self.want_llms:
+                self.docker = read_docker()
+            if self.want_llms:
+                self.llm_servers = find_llm_servers(self.docker)
         listeners = (
-            read_listeners(self.port_ranges, self.docker_ports, self.docker_names)
+            read_listeners(self.port_ranges, self.docker.ports, self.docker.names)
             if self.port_ranges is not None
             else None
         )
-        return self.services, listeners, (self.air.sample() if self.air else None)
+        llms = read_llms(self.llm_servers, procs) if self.llm_servers else None
+        return self.services, listeners, (self.air.sample() if self.air else None), llms
 
 
 def run_once(interval: float, extras: Extras) -> int:
     gpus = read_gpus()
     procs = read_procs()
-    services, listeners, air = extras.sample()
+    services, listeners, air, llms = extras.sample(procs)
     width = shutil.get_terminal_size((100, 24)).columns
     # height 0 = show everything
     print(
         render(
             gpus, procs, width, 0, interval,
-            services=services, listeners=listeners, air=air,
+            services=services, listeners=listeners, air=air, llms=llms,
         )
     )
     return 0
@@ -1461,7 +1976,7 @@ def run_live(interval: float, extras: Extras) -> int:
             try:
                 gpus = read_gpus()
                 procs = read_procs()
-                services, listeners, air = extras.sample()
+                services, listeners, air, llms = extras.sample(procs)
                 size = shutil.get_terminal_size((100, 24))
                 frame = render(
                     gpus,
@@ -1473,6 +1988,7 @@ def run_live(interval: float, extras: Extras) -> int:
                     services=services,
                     listeners=listeners,
                     air=air,
+                    llms=llms,
                 )
             except SmiError as e:
                 frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
@@ -1547,6 +2063,11 @@ def main(argv: list[str] | None = None) -> int:
         help="hide the air-quality pane",
     )
     p.add_argument(
+        "--no-llms",
+        action="store_true",
+        help="hide the local-LLMs pane",
+    )
+    p.add_argument(
         "--db",
         default=default_db_path(),
         metavar="PATH",
@@ -1584,6 +2105,7 @@ def main(argv: list[str] | None = None) -> int:
     extras = Extras(
         want_services=not args.no_services,
         port_ranges=ranges,
+        want_llms=not args.no_llms,
         air=None if args.no_air else AirReader(args.air_device, db),
         db=db,
     )

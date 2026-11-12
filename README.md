@@ -32,6 +32,7 @@ sparktop --no-services     # hide the services pane
 
 sparktop --air-device /dev/ttyACM0   # air sensor's serial port
 sparktop --no-air          # hide the air-quality pane
+sparktop --no-llms         # hide the local-LLMs pane
 
 sparktop --db ~/air.db     # where the sqlite database lives
 sparktop --no-db           # don't record anything
@@ -42,6 +43,7 @@ sparktop --no-db           # don't record anything
 - Per-GPU compute and memory utilization bars (color-coded by load)
 - Temperature, power draw/limit, SM clock, and P-state
 - **Air** — the room, if an air-quality sensor is plugged into USB
+- **LLMs** — the models being served locally, and whether they're busy
 - **Services** — the systemd units you wrote, system and user, with state and PID
 - **Ports** — what's listening on the common dev ports, and who owns it
 - GPU compute processes, sorted by memory use
@@ -120,6 +122,56 @@ One row every 30 seconds comes to roughly a megabyte a day; nothing is
 pruned. The database is opened in WAL mode, so a second sparktop or a
 `sqlite3` shell can read it while one is writing. If the file can't be
 opened, sparktop says so on stderr and runs without it.
+
+## LLMs
+
+Any model server running on the box gets a row per model it's serving:
+
+```
+LLMs  (1 model)
+    MODEL                                       ENGINE     STATE      MEM  PORT  OWNER
+  ● Qwen3.6-35B-A3B-Abliterated-Heretic-Q4_K_M  llama.cpp  idle   20.2GiB  8095  brent-llm ·docker
+```
+
+Servers are found by the program they run, read from `/proc/<pid>/cmdline`,
+which is world-readable — so root's servers, and those inside containers,
+show up too:
+
+| engine | recognised as |
+|---|---|
+| llama.cpp | `llama-server`, `llama-cli` |
+| llama-cpp-python | `python -m llama_cpp.server` |
+| ollama | `ollama serve` |
+| vLLM | `vllm serve`, `python -m vllm.entrypoints.openai.api_server` |
+| SGLang | `python -m sglang.launch_server` |
+| TensorRT-LLM | `trtllm-serve` |
+| TGI | `text-generation-launcher` |
+| KoboldCpp | `koboldcpp` |
+
+Matching is on the program, never on a word somewhere in the command line,
+so `grep llama-server` or `ollama run` (a client) don't count. Add to
+`LLM_PROGRAMS` in the script for anything else.
+
+`MODEL` comes from the command line (`-m`, `--model`, `-hf`, or the
+positional model of `vllm serve`), trimmed to the file or repo name.
+`MEM` is what nvidia-smi charges to the server and every process it spawned
+(vLLM's GPU memory lives in a child engine process), falling back to RSS
+for a model running on the CPU. `PORT` is where the API answers from the
+host: for a container, that's the published port, not the one inside it.
+
+`STATE` comes from asking the server, once a frame, on localhost:
+
+- **llama.cpp** — `/slots`: `busy 1/2` is one of two slots generating.
+  llama-server only answers between batches, so a request that doesn't
+  come back within 0.3s also reads as `busy`. `loading` while the model is
+  still being read in.
+- **vLLM** — `vllm:num_requests_running` from `/metrics`.
+- **ollama** — `/api/ps`, which is also where the model names come from:
+  one row per loaded model, or `(no model loaded)` if it's sitting idle.
+
+Everything else reads `running`, meaning the process is there.
+
+The pane appears only when something is serving.
 
 ## Services
 
