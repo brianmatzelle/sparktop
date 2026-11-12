@@ -13,6 +13,7 @@ Usage:
     sparktop --no-services   # hide the systemd services pane
     sparktop --no-ports      # hide the listening-ports pane
     sparktop --no-air        # hide the air-quality pane
+    sparktop --no-disk       # hide the disk pane
     sparktop --no-llms       # hide the local-LLMs pane
     sparktop --db PATH       # where the sqlite database lives
     sparktop --no-db         # don't record anything
@@ -215,6 +216,20 @@ class Air:
 
 
 @dataclass
+class Disk:
+    """One mounted filesystem on a real device."""
+    mount: str
+    total: float  # MiB
+    used: float
+    free: float   # what an ordinary user can still write
+
+    @property
+    def pct(self) -> float:
+        # As df counts it: of what can be used, not of the raw size.
+        return self.used / (self.used + self.free) * 100 if self.used + self.free else 0.0
+
+
+@dataclass
 class Docker:
     """What `docker ps` says about the running containers (see read_docker)."""
     ports: dict[int, str] = field(default_factory=dict)  # published host port -> name
@@ -364,6 +379,44 @@ def read_meminfo() -> tuple[float | None, float | None]:
     if total is None or avail is None:
         return None, None
     return total, total - avail
+
+
+DISK_MIN_MIB = 1024  # smaller than this is a boot or firmware partition
+
+
+def read_disks() -> list[Disk]:
+    """The filesystems on real block devices, biggest first.
+
+    /proc/mounts lists every tmpfs, overlay and snap image too; what counts
+    here is a /dev/ device that isn't a loop image, once each (a device
+    mounted in several places is listed at its shortest path).
+    """
+    seen: dict[str, str] = {}
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                dev, mount = parts[0], parts[1].replace("\\040", " ")
+                if not dev.startswith("/dev/") or dev.startswith("/dev/loop"):
+                    continue
+                if dev not in seen or len(mount) < len(seen[dev]):
+                    seen[dev] = mount
+    except OSError:
+        return []
+    disks = []
+    for mount in seen.values():
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue
+        mib = st.f_frsize / (1024 * 1024)
+        total = st.f_blocks * mib
+        if total >= DISK_MIN_MIB:
+            disks.append(Disk(mount, total, (st.f_blocks - st.f_bfree) * mib, st.f_bavail * mib))
+    disks.sort(key=lambda d: (-d.total, d.mount))
+    return disks
 
 
 def read_procs() -> list[Proc]:
@@ -1474,6 +1527,34 @@ def gib(mib: float | None) -> str:
     return f"{mib / 1024:.1f}GiB"
 
 
+def size(mib: float) -> str:
+    """A disk-sized amount: 819G, 3.7T."""
+    g = mib / 1024
+    if g >= 1000:
+        return f"{g / 1024:.1f}T"
+    return f"{g:.0f}G" if g >= 10 else f"{g:.1f}G"
+
+
+def disk_section(disks: list[Disk], width: int, narrow: bool) -> list[str]:
+    """Render the 'Disk' pane: a bar per filesystem, and what is left on it."""
+    lines = [C.wrap("Disk", C.BOLD)]
+    if narrow:
+        bar_w = max(10, min(40, width - 12))
+    else:
+        bar_w = max(20, min(40, width - 36))
+    for d in disks:
+        name = _elide(d.mount, 7).ljust(7)
+        inside = size(d.used) if narrow else f"{size(d.used)}/{size(d.total)}"
+        # A disk is fine at 60% full, where a GPU would be busy.
+        col = C.RED if d.pct >= 90 else C.YELLOW if d.pct >= 80 else C.GREEN
+        line = f"  {name} " + bar(d.pct, bar_w, inside, col)
+        if not narrow:
+            line += "  " + C.wrap(fmt(d.pct, "%"), col)
+            line += C.wrap(f" {size(d.free)} free", C.GREY)
+        lines.append(line)
+    return lines
+
+
 def wrap_stats(stats: list[tuple], width: int, indent: str = "  ") -> list[str]:
     """Pack `(label, value)` stat segments into lines that fit `width`.
 
@@ -1807,6 +1888,7 @@ def render(
     listeners: list[Listener] | None = None,
     air: Air | None = None,
     llms: list[Llm] | None = None,
+    disks: list[Disk] | None = None,
 ) -> str:
     lines: list[str] = []
     host = os.uname().nodename
@@ -1890,6 +1972,9 @@ def render(
         # First of the secondary panes: it's the shortest of them, and a
         # room you have to leave outranks a service you can restart.
         blocks.append(air_section(air, width, narrow))
+    if disks:
+        # Two rows, and a full disk stops everything listed below it.
+        blocks.append(disk_section(disks, width, narrow))
     if llms:
         # Only when something is serving: a row per model is short, and
         # what's on the GPU is the next thing you'd ask a GPU monitor.
@@ -1954,7 +2039,9 @@ class Extras:
         want_llms: bool = False,
         air: AirReader | None = None,
         db: Db | None = None,
+        want_disks: bool = True,
     ):
+        self.want_disks = want_disks
         self.want_services = want_services
         self.port_ranges = port_ranges
         self.want_llms = want_llms
@@ -1964,6 +2051,9 @@ class Extras:
         self.docker = Docker()
         self.llm_servers: list[LlmServer] | None = None
         self._stamp = 0.0
+
+    def disks(self) -> list[Disk] | None:
+        return read_disks() if self.want_disks else None  # a statvfs each: no TTL needed
 
     def close(self) -> None:
         if self.air is not None:
@@ -2002,6 +2092,7 @@ def run_once(interval: float, extras: Extras) -> int:
         render(
             gpus, procs, width, 0, interval,
             services=services, listeners=listeners, air=air, llms=llms,
+            disks=extras.disks(),
         )
     )
     return 0
@@ -2047,6 +2138,13 @@ def snapshot(extras: Extras) -> dict:
         out["ports"] = [
             {"port": ln.port, "proto": ln.proto, "owner": ln.owner, "public": ln.public}
             for ln in listeners
+        ]
+    disks = extras.disks()
+    if disks is not None:
+        out["disks"] = [
+            {"mount": d.mount, "total": round(d.total), "used": round(d.used),
+             "free": round(d.free), "pct": round(d.pct, 1)}
+            for d in disks
         ]
     if air is not None and not air.pending:
         out["air"] = {
@@ -2213,6 +2311,7 @@ def run_live(interval: float, extras: Extras) -> int:
                     listeners=listeners,
                     air=air,
                     llms=llms,
+                    disks=extras.disks(),
                 )
             except SmiError as e:
                 frame = C.wrap("sparktop error\n\n", C.BOLD, C.RED) + str(e)
@@ -2300,6 +2399,7 @@ def main(argv: list[str] | None = None) -> int:
             "Feather/ESP32 under /dev/serial/by-id; $SPARKTOP_AIR_DEVICE)"
         ),
     )
+    p.add_argument("--no-disk", action="store_true", help="hide the disk pane")
     p.add_argument(
         "--no-air",
         action="store_true",
@@ -2350,6 +2450,7 @@ def main(argv: list[str] | None = None) -> int:
         port_ranges=ranges,
         want_llms=not args.no_llms,
         air=None if args.no_air else AirReader(args.air_device, db, args.air_udp),
+        want_disks=not args.no_disk,
         db=db,
     )
 

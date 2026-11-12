@@ -41,6 +41,7 @@ sparktop --air-udp 0                 # don't also listen for the sensor's WiFi b
                                      # same subnet is heard that way; a reading that
                                      # arrives both ways is recorded once)
 sparktop --no-air          # hide the air-quality pane
+sparktop --no-disk         # hide the disk pane
 sparktop --no-llms         # hide the local-LLMs pane
 
 sparktop --db ~/air.db     # where the sqlite database lives
@@ -52,6 +53,7 @@ sparktop --no-db           # don't record anything
 - Per-GPU compute and memory utilization bars (color-coded by load)
 - Temperature, power draw/limit, SM clock, and P-state
 - **Air** — the room, if an air-quality sensor is plugged into USB
+- **Disk** — how full each real filesystem is, and what is left on it
 - **LLMs** — the models being served locally, and whether they're busy
 - **Services** — the systemd units you wrote, system and user, with state and PID
 - **Ports** — what's listening on the common dev ports, and who owns it
